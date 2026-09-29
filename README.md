@@ -1,5 +1,9 @@
 # lunch-bot
 
+[![CI](https://github.com/Gnaiqing/lunch-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/Gnaiqing/lunch-bot/actions/workflows/ci.yml)
+
+CI runs the `pytest` suite on every push and pull request.
+
 A Slack bot that runs a weekly lunch-decision workflow for a reading group: it
 discovers nearby restaurants, posts a diversity-aware poll, records votes,
 announces the winner, and reminds the group to order — while the **organizer**
