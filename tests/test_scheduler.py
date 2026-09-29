@@ -142,3 +142,34 @@ def test_preexisting_open_poll_is_reconciled(tmp_path):
     assert db.get_poll(conn, stale_id)["status"] == "closed"
     # Reconciliation posts no winner announcement: only the new poll was posted.
     assert client.calls == 1
+
+
+# ---------------------------------------------------------------------------
+# H3 (multiple) — MANY pre-existing open polls are ALL reconciled, not just the
+# newest, so the at-most-one-open-poll invariant holds after creation.
+# ---------------------------------------------------------------------------
+def test_multiple_preexisting_open_polls_are_all_reconciled(tmp_path):
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    ids = _seed(conn)
+
+    # Simulate several stale open polls that leaked (legacy state / manual DB
+    # recovery) — more than get_open_poll() (newest-only) would ever revisit.
+    stale_ids = [
+        db.create_poll(conn, "C_TEST", ids[:3], closes_at="2000-01-01T00:00:00+00:00")
+        for _ in range(3)
+    ]
+    assert len(_open_polls(conn)) == 3
+
+    config = _config()
+    client = _OkClient()
+    new_id = scheduler.create_weekly_poll(config, conn, client)
+
+    assert new_id is not None and new_id not in stale_ids
+    # Exactly one open poll remains — the new one; every prior poll is closed.
+    open_polls = _open_polls(conn)
+    assert len(open_polls) == 1
+    assert open_polls[0]["id"] == new_id
+    for stale_id in stale_ids:
+        assert db.get_poll(conn, stale_id)["status"] == "closed"
+    # No winner announcement posted for any reconciled poll: only the new poll.
+    assert client.calls == 1

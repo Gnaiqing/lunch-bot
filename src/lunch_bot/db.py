@@ -319,6 +319,20 @@ def get_open_poll(conn: sqlite3.Connection, slack_channel: str) -> Optional[sqli
     ).fetchone()
 
 
+def get_open_polls(conn: sqlite3.Connection, slack_channel: str) -> list[sqlite3.Row]:
+    """Return ALL open polls for a channel (oldest first).
+
+    Unlike :func:`get_open_poll` (newest only), this surfaces every open poll so
+    callers can reconcile a channel down to the at-most-one-open-poll invariant
+    when more than one has leaked (a legacy state, a prior version, or manual DB
+    recovery).
+    """
+    return conn.execute(
+        "SELECT * FROM polls WHERE slack_channel = ? AND status = 'open' ORDER BY id",
+        (slack_channel,),
+    ).fetchall()
+
+
 def close_poll(conn: sqlite3.Connection, poll_id: int, winner_restaurant_id: Optional[int]) -> None:
     with _write_lock:
         conn.execute(

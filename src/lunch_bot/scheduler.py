@@ -68,13 +68,13 @@ def create_weekly_poll(config: Config, conn, client, *, llm=None) -> int | None:
     if not candidates:
         return None
 
-    # Reconcile any pre-existing open poll before opening a new one, so there is
-    # never more than one open poll (a missed/failed close job would otherwise
-    # leave a stale poll that get_open_poll() never revisits). Close + tally it
-    # in place WITHOUT announcing a winner — we don't want a surprise message —
-    # then log that it was reconciled.
-    stale = db.get_open_poll(conn, config.slack_channel_id)
-    if stale is not None:
+    # Reconcile EVERY pre-existing open poll before opening a new one, so there is
+    # never more than one open poll. A missed/failed close job leaves a stale poll,
+    # and multiple can accumulate (legacy state, a prior version, or manual DB
+    # recovery); get_open_poll() only ever revisits the newest, so we must close
+    # them all here. Close + tally each in place WITHOUT announcing a winner — we
+    # don't want a surprise message — then log that it was reconciled.
+    for stale in db.get_open_polls(conn, config.slack_channel_id):
         db.close_poll_and_tally(conn, stale["id"])
         logger.warning(
             "Reconciled stale open poll %s (closed without announcement) before creating a new poll.",
