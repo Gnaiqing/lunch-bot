@@ -19,10 +19,13 @@ from __future__ import annotations
 
 import random
 import re
+import uuid
+from urllib.parse import urlencode
 
 from . import db, polls
 from .commands import MentionCommand, match_restaurants, parse_mention_command
 from .config import Config
+from .models import Restaurant
 from .selection import select_candidates
 
 # Matches a leading "<@U123ABC>" mention so we can strip it before parsing.
@@ -61,8 +64,8 @@ def build_app(config: Config, conn, llm=None):
     # only when actually called.
     from .discovery import validate_suggestion
 
-    def add_restaurant_to_pool(query: str):
-        """Validate one free-text restaurant query and persist it."""
+    def find_restaurant_suggestion(query: str):
+        """Resolve a query through Google Places without persisting anything."""
         name = query
         location_hint = None
         if llm is not None:
@@ -80,13 +83,96 @@ def build_app(config: Config, conn, llm=None):
         if restaurant is None:
             return None, f"Hmm, I couldn't find '{name}' on Google Places within our budget."
 
-        if llm is not None and not restaurant.cuisine:
-            try:
-                restaurant.cuisine = llm.classify_cuisine(restaurant.name, restaurant.address)
-            except Exception:  # pragma: no cover - provider best-effort
-                pass
-        restaurant.id = db.upsert_restaurant(conn, restaurant)
         return restaurant, None
+
+    def request_restaurant_confirmation(
+        query: str,
+        event: dict,
+        client,
+        *,
+        target: str,
+        poll_id: int | None = None,
+    ) -> tuple[bool, str | None]:
+        """Post a confirmation card while keeping the match out of the pool."""
+        restaurant, error = find_restaurant_suggestion(query)
+        if restaurant is None:
+            return False, error
+        user_id = event.get("user")
+        channel = event.get("channel")
+        if not user_id or not channel:
+            return False, "I couldn't identify the requesting user or channel."
+
+        token = uuid.uuid4().hex
+        db.create_pending_restaurant_confirmation(
+            conn,
+            token=token,
+            slack_user_id=user_id,
+            slack_channel=channel,
+            query=query,
+            target=target,
+            poll_id=poll_id,
+            restaurant=restaurant,
+        )
+        details = [f"*{restaurant.name}*"]
+        if restaurant.address:
+            details.append(restaurant.address)
+        if restaurant.price_level is not None:
+            details.append(f"Google price level: {restaurant.price_level}/4")
+        maps_params = {"api": 1, "query": restaurant.name}
+        if restaurant.place_id:
+            maps_params["query_place_id"] = restaurant.place_id
+        maps_url = "https://www.google.com/maps/search/?" + urlencode(maps_params)
+        details.append(f"<{maps_url}|Open in Google Maps>")
+        destination = "the candidate list"
+        if target == "poll":
+            destination += " and the current poll"
+        blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "I found this Google Maps result:\n" + "\n".join(details),
+                },
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"Is this the restaurant you meant? It will only be added to {destination} after you confirm.",
+                },
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "style": "primary",
+                        "text": {"type": "plain_text", "text": "Confirm"},
+                        "action_id": "restaurant_confirm",
+                        "value": token,
+                    },
+                    {
+                        "type": "button",
+                        "style": "danger",
+                        "text": {"type": "plain_text", "text": "Not this one"},
+                        "action_id": "restaurant_cancel",
+                        "value": token,
+                    },
+                ],
+            },
+        ]
+        try:
+            client.chat_postMessage(
+                channel=channel,
+                text=f"Please confirm the Google Maps match for {restaurant.name}.",
+                blocks=blocks,
+            )
+        except Exception:
+            claimed = db.claim_pending_restaurant_confirmation(conn, token, user_id)
+            if claimed is not None:
+                db.resolve_pending_restaurant_confirmation(conn, token, "failed")
+            return False, "I found a match but couldn't post the confirmation card."
+        return True, None
 
     def choose_from_pool(query: str, *, excluding: set[int] | None = None):
         """Resolve a name/cuisine query to one active restaurant."""
@@ -133,13 +219,41 @@ def build_app(config: Config, conn, llm=None):
                 lines.append(f"• {restaurant.name} — {count} vote{'s' if count != 1 else ''}")
         return "\n".join(lines)
 
-    def resolve_or_add(query: str, *, excluding: set[int] | None = None):
-        restaurant = choose_from_pool(query, excluding=excluding)
-        if restaurant is not None:
-            return restaurant, None
-        return add_restaurant_to_pool(query)
+    def conversation_context() -> str:
+        restaurants = sorted(
+            db.get_active_restaurants(conn), key=lambda restaurant: restaurant.name.casefold()
+        )
+        names = ", ".join(restaurant.name for restaurant in restaurants)
+        return (
+            f"Configured channel: {config.slack_channel_name}.\n"
+            f"Weekly schedule: poll {config.schedule['poll_create'].day} "
+            f"{config.schedule['poll_create'].time_str}, close "
+            f"{config.schedule['poll_close'].day} {config.schedule['poll_close'].time_str}, "
+            f"timezone {config.timezone}.\n"
+            f"Candidate restaurants ({len(restaurants)}): {names or 'none'}.\n"
+            f"{current_poll_text()}\n"
+            "Supported mutations require explicit commands: create a poll, add a named "
+            "restaurant to the candidate list, or add a restaurant/cuisine to the open poll."
+        )
 
-    def handle_create_poll(command: MentionCommand, say, client) -> None:
+    def update_poll_message(poll_id: int, client) -> bool:
+        poll = db.get_poll(conn, poll_id)
+        if poll is None or poll["status"] != "open" or not poll["slack_ts"]:
+            return False
+        option_ids = db.get_poll_option_ids(conn, poll_id)
+        restaurants = [db.get_restaurant(conn, restaurant_id) for restaurant_id in option_ids]
+        restaurants = [restaurant for restaurant in restaurants if restaurant is not None]
+        client.chat_update(
+            channel=poll["slack_channel"],
+            ts=poll["slack_ts"],
+            blocks=polls.build_poll_blocks(
+                poll_id, restaurants, tally=db.tally_votes(conn, poll_id)
+            ),
+            text="Lunch poll updated",
+        )
+        return True
+
+    def handle_create_poll(command: MentionCommand, event, say, client) -> None:
         if command.count is not None:
             count = command.count
         elif len(command.queries) >= 2:
@@ -155,11 +269,19 @@ def build_app(config: Config, conn, llm=None):
         required_ids: list[int] = []
         unresolved: list[str] = []
         for query in command.queries:
-            restaurant, error = resolve_or_add(query, excluding=set(required_ids))
-            if restaurant is None:
-                unresolved.append(error or query)
-            elif restaurant.id is not None:
+            restaurant = choose_from_pool(query, excluding=set(required_ids))
+            if restaurant is not None and restaurant.id is not None:
                 required_ids.append(restaurant.id)
+                continue
+            requested, error = request_restaurant_confirmation(
+                query, event, client, target="pool"
+            )
+            if requested:
+                unresolved.append(
+                    f"Confirm the Google Maps match for '{query}', then request the poll again."
+                )
+            else:
+                unresolved.append(error or query)
         if unresolved:
             say("I couldn't resolve every requested choice:\n• " + "\n• ".join(unresolved))
             return
@@ -177,7 +299,7 @@ def build_app(config: Config, conn, llm=None):
         if poll_id is None:
             say("I couldn't create the poll. Check the bot logs and make sure the candidate list is not empty.")
 
-    def handle_add_to_poll(command: MentionCommand, say, client) -> None:
+    def handle_add_to_poll(command: MentionCommand, event, say, client) -> None:
         poll = db.get_open_poll(conn, config.slack_channel_id)
         if poll is None:
             say("There is no open poll. Create one first with `@lunch-bot create a poll with 4 choices`.")
@@ -190,9 +312,17 @@ def build_app(config: Config, conn, llm=None):
         added_ids: list[int] = []
         failures: list[str] = []
         for query in command.queries:
-            restaurant, error = resolve_or_add(query, excluding=existing_ids | set(added_ids))
-            if restaurant is None or restaurant.id is None:
-                failures.append(error or f"Couldn't resolve '{query}'.")
+            restaurant = choose_from_pool(query, excluding=existing_ids | set(added_ids))
+            if restaurant is None:
+                requested, error = request_restaurant_confirmation(
+                    query, event, client, target="poll", poll_id=poll["id"]
+                )
+                if requested:
+                    failures.append(
+                        f"Waiting for your confirmation before adding '{query}' to the poll."
+                    )
+                else:
+                    failures.append(error or f"Couldn't resolve '{query}'.")
                 continue
             if db.add_poll_option_if_open(conn, poll["id"], restaurant.id):
                 added_ids.append(restaurant.id)
@@ -203,18 +333,8 @@ def build_app(config: Config, conn, llm=None):
             say("\n".join(failures) if failures else "No new choices were added.")
             return
 
-        option_ids = db.get_poll_option_ids(conn, poll["id"])
-        restaurants = [db.get_restaurant(conn, restaurant_id) for restaurant_id in option_ids]
-        restaurants = [restaurant for restaurant in restaurants if restaurant is not None]
         try:
-            client.chat_update(
-                channel=config.slack_channel_id,
-                ts=poll["slack_ts"],
-                blocks=polls.build_poll_blocks(
-                    poll["id"], restaurants, tally=db.tally_votes(conn, poll["id"])
-                ),
-                text="Lunch poll updated",
-            )
+            update_poll_message(poll["id"], client)
         except Exception as exc:  # pragma: no cover - Slack network best-effort
             for restaurant_id in added_ids:
                 db.remove_poll_option(conn, poll["id"], restaurant_id)
@@ -247,6 +367,7 @@ def build_app(config: Config, conn, llm=None):
                 "• `@lunch-bot create a poll with 4 choices including Pala 148`\n"
                 "• `@lunch-bot add a pizza restaurant to this week's poll`\n"
                 "• `@lunch-bot show the current poll`\n"
+                "New Google Maps matches require your confirmation before they are added. "
                 "Poll votes are multi-select; click a choice again to remove that vote."
             )
             return
@@ -257,29 +378,174 @@ def build_app(config: Config, conn, llm=None):
             say(current_poll_text())
             return
         if command.kind == "create_poll":
-            handle_create_poll(command, say, client)
+            handle_create_poll(command, event, say, client)
             return
         if command.kind == "add_to_poll":
-            handle_add_to_poll(command, say, client)
+            handle_add_to_poll(command, event, say, client)
+            return
+        if command.kind == "conversation":
+            if llm is None:
+                say(
+                    "I'm Lunch Bot. I manage restaurant candidates and weekly lunch polls. "
+                    "Conversational QA is unavailable right now, but I did not change anything. "
+                    "Mention me with `help` to see commands."
+                )
+                return
+            try:
+                answer = llm.answer_question(text, conversation_context())
+            except Exception:  # pragma: no cover - provider best-effort
+                answer = ""
+            say(
+                answer
+                or "I couldn't answer that right now, but I did not change anything. "
+                "Mention me with `help` to see commands."
+            )
             return
 
-        successes: list[str] = []
+        already_available: list[str] = []
+        pending: list[str] = []
         failures: list[str] = []
         for query in command.queries:
-            restaurant, error = add_restaurant_to_pool(query)
-            if restaurant is None:
+            existing = choose_from_pool(query)
+            if existing is not None:
+                already_available.append(existing.name)
+                continue
+            requested, error = request_restaurant_confirmation(
+                query, event, client, target="pool"
+            )
+            if not requested:
                 failures.append(error or f"Couldn't add '{query}'.")
             else:
-                label = f"*{restaurant.name}*"
-                if restaurant.cuisine:
-                    label += f" ({restaurant.cuisine})"
-                successes.append(label)
-        response = ""
-        if successes:
-            response = "Added " + ", ".join(successes) + " to the lunch candidate list. 🍜"
+                pending.append(query)
+        response_parts: list[str] = []
+        if already_available:
+            response_parts.append(
+                "Already in the candidate list: *" + "*, *".join(already_available) + "*."
+            )
+        if pending:
+            response_parts.append(
+                "I found Google Maps matches for "
+                + ", ".join(f"'{query}'" for query in pending)
+                + ". Please use the confirmation card"
+                + ("s" if len(pending) != 1 else "")
+                + " above; nothing has been added yet."
+            )
         if failures:
-            response += ("\n" if response else "") + "\n".join(failures)
-        say(response or "I couldn't understand that request. Mention me with `help` for examples.")
+            response_parts.extend(failures)
+        if response_parts:
+            say("\n".join(response_parts))
+
+    def action_message_location(body: dict) -> tuple[str | None, str | None]:
+        channel = body.get("channel", {}).get("id")
+        ts = body.get("container", {}).get("message_ts")
+        return channel, ts
+
+    def action_error(client, body: dict, text: str) -> None:
+        channel, _ = action_message_location(body)
+        user_id = body.get("user", {}).get("id")
+        if channel and user_id:
+            client.chat_postEphemeral(channel=channel, user=user_id, text=text)
+
+    @app.action("restaurant_confirm")
+    def handle_restaurant_confirm(ack, body, client):
+        """Persist a Google Places match only after its requester confirms it."""
+        ack()
+        action = body.get("actions", [{}])[0]
+        token = action.get("value", "")
+        user_id = body.get("user", {}).get("id")
+        pending = db.get_pending_restaurant_confirmation(conn, token)
+        if pending is None:
+            action_error(client, body, "This restaurant confirmation no longer exists.")
+            return
+        if pending["slack_user_id"] != user_id:
+            action_error(client, body, "Only the person who requested this restaurant can confirm it.")
+            return
+        claimed = db.claim_pending_restaurant_confirmation(conn, token, user_id)
+        if claimed is None:
+            action_error(client, body, "This restaurant confirmation has already been handled.")
+            return
+
+        restaurant = Restaurant(
+            name=claimed["name"],
+            cuisine=claimed["cuisine"],
+            address=claimed["address"],
+            place_id=claimed["place_id"],
+            lat=claimed["lat"],
+            lng=claimed["lng"],
+            price_level=claimed["price_level"],
+            source=claimed["source"],
+        )
+        try:
+            if llm is not None and not restaurant.cuisine:
+                try:
+                    restaurant.cuisine = llm.classify_cuisine(
+                        restaurant.name, restaurant.address
+                    )
+                except Exception:  # pragma: no cover - provider best-effort
+                    pass
+            restaurant.id = db.upsert_restaurant(conn, restaurant)
+            poll_added = False
+            if claimed["target"] == "poll" and claimed["poll_id"] is not None:
+                poll_added = db.add_poll_option_if_open(
+                    conn, claimed["poll_id"], restaurant.id
+                )
+                if poll_added:
+                    try:
+                        updated = update_poll_message(claimed["poll_id"], client)
+                    except Exception:
+                        db.remove_poll_option(conn, claimed["poll_id"], restaurant.id)
+                        poll_added = False
+                    else:
+                        poll_added = updated
+                        if poll_added:
+                            db.increment_selection_counts(conn, [restaurant.id])
+            db.resolve_pending_restaurant_confirmation(conn, token, "confirmed")
+        except Exception:
+            db.resolve_pending_restaurant_confirmation(conn, token, "failed")
+            raise
+
+        message = f"Confirmed and added *{restaurant.name}* to the candidate list."
+        if claimed["target"] == "poll":
+            if poll_added:
+                message += " It was also added to the current poll."
+            else:
+                message += " The requested poll was no longer available to update."
+        channel, ts = action_message_location(body)
+        if channel and ts:
+            client.chat_update(
+                channel=channel,
+                ts=ts,
+                text=message,
+                blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": message}}],
+            )
+
+    @app.action("restaurant_cancel")
+    def handle_restaurant_cancel(ack, body, client):
+        """Cancel a pending match without changing the restaurant pool."""
+        ack()
+        token = body.get("actions", [{}])[0].get("value", "")
+        user_id = body.get("user", {}).get("id")
+        pending = db.get_pending_restaurant_confirmation(conn, token)
+        if pending is None:
+            action_error(client, body, "This restaurant confirmation no longer exists.")
+            return
+        if pending["slack_user_id"] != user_id:
+            action_error(client, body, "Only the person who requested this restaurant can cancel it.")
+            return
+        claimed = db.claim_pending_restaurant_confirmation(conn, token, user_id)
+        if claimed is None:
+            action_error(client, body, "This restaurant confirmation has already been handled.")
+            return
+        db.resolve_pending_restaurant_confirmation(conn, token, "cancelled")
+        message = f"Cancelled. *{claimed['name']}* was not added."
+        channel, ts = action_message_location(body)
+        if channel and ts:
+            client.chat_update(
+                channel=channel,
+                ts=ts,
+                text=message,
+                blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": message}}],
+            )
 
     @app.action(re.compile(r"^vote::"))
     def handle_vote_action(ack, body, client):

@@ -18,6 +18,16 @@ from lunch_bot.llm import (
 from lunch_bot.main import active_llm_api_key, missing_llm_key_env
 
 
+class _CapturingClient(LLMClient):
+    def __init__(self):
+        super().__init__("test-model")
+        self.call = None
+
+    def _complete_text(self, system, user, *, max_tokens=256):
+        self.call = (system, user, max_tokens)
+        return "I manage lunch polls."
+
+
 def _cfg(tmp_path, env):
     return load_config(config_path=str(tmp_path / "none.yaml"), env=env, load_dotenv=False)
 
@@ -66,6 +76,17 @@ def test_llm_client_class_selection():
 def test_llm_client_class_invalid_raises():
     with pytest.raises(ValueError):
         llm_client_class("nope")
+
+
+def test_conversation_answer_is_read_only_prompted():
+    client = _CapturingClient()
+    answer = client.answer_question("Who are you?", "Candidate restaurants (1): Pala 148")
+    assert answer == "I manage lunch polls."
+    system, user, max_tokens = client.call
+    assert "Never claim" in system
+    assert "changed any state" in system
+    assert "Pala 148" in user
+    assert max_tokens == 300
 
 
 def test_build_llm_client_anthropic(tmp_path):

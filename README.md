@@ -58,6 +58,15 @@ uses the existing candidate pool; if it is not present, the bot validates it
 through Google Places and adds it. A cuisine request such as “pizza restaurant”
 selects a matching candidate that is not already in the poll.
 
+Messages that do not match an explicit command use read-only conversational QA
+and never mutate the database. Restaurant suggestions must be explicit, such as
+`add Pai Northern Thai to the candidate list` or
+`restaurant suggestion: Pai Northern Thai`. Suggested places must be food-related,
+within the configured search radius, and within the configured price level. The
+bot then shows the matched Google Maps name and address with **Confirm** and
+**Not this one** buttons. Only the requesting user can confirm, and the restaurant
+is not added to the candidate list or an open poll until that confirmation.
+
 ## Architecture
 
 ```

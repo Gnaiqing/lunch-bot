@@ -16,11 +16,35 @@ list (CSV) to bootstrap the pool before the first Nearby Search runs.
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 from .config import Config
 from .db import set_cuisine, upsert_restaurant
 from .models import Restaurant
+
+
+FOOD_PLACE_TYPES = {
+    "bakery",
+    "cafe",
+    "food",
+    "meal_delivery",
+    "meal_takeaway",
+    "restaurant",
+}
+
+
+def _distance_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """Return the great-circle distance between two coordinates in metres."""
+    earth_radius_m = 6_371_000
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lng2 - lng1)
+    a = (
+        math.sin(delta_phi / 2) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
+    )
+    return earth_radius_m * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
 def _client(api_key: str):
@@ -95,22 +119,36 @@ def validate_suggestion(config: Config, name: str, location_hint: Optional[str] 
     config.require("google_maps_api_key")
     gmaps = _client(config.google_maps_api_key)
     query = name if not location_hint else f"{name} {location_hint}"
-    response = gmaps.places(query=query)
+    response = gmaps.places(
+        query=query,
+        location=(config.office_lat, config.office_lng),
+        radius=config.search_radius_m,
+        type="restaurant",
+    )
     results = response.get("results", [])
     if not results:
         return None
     place = results[0]
+    place_types = set(place.get("types", []))
+    if not place_types.intersection(FOOD_PLACE_TYPES):
+        return None
     price_level = place.get("price_level")
     if price_level is not None and price_level > config.max_price_level:
         return None
     geometry = place.get("geometry", {}).get("location", {})
+    lat = geometry.get("lat")
+    lng = geometry.get("lng")
+    if lat is None or lng is None:
+        return None
+    if _distance_m(config.office_lat, config.office_lng, lat, lng) > config.search_radius_m:
+        return None
     return Restaurant(
         name=place.get("name", name),
         cuisine=None,
         address=place.get("formatted_address"),
         place_id=place.get("place_id"),
-        lat=geometry.get("lat"),
-        lng=geometry.get("lng"),
+        lat=lat,
+        lng=lng,
         price_level=price_level,
         source="suggestion",
     )

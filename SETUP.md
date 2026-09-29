@@ -242,7 +242,10 @@ to `timezone`.
   person; click a selected choice again to remove it). Anyone can @-mention the
   bot to list or add restaurant candidates, create or inspect a poll, and add a
   restaurant or cuisine choice to the open poll. Mention `@Lunch Bot help` for
-  examples.
+  examples. Unmatched messages use read-only conversational QA; only explicit
+  restaurant-suggestion commands can modify the candidate list. A new Google
+  Maps match is shown to the requester for confirmation first; it is added only
+  after that user clicks **Confirm**.
 - **Poll close + announce — Wed 10:00** — the bot closes the poll, tallies and
   records the votes (updating preference memory), and announces the winner. It
   prompts the **organizer** to create and post the Uber Eats **group-order** link

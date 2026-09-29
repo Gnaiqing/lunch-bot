@@ -97,6 +97,24 @@ class LLMClient:
         raw = self._complete_text(system, text, max_tokens=128)
         return _safe_parse_suggestion(raw)
 
+    def answer_question(self, text: str, context: str) -> str:
+        """Answer a read-only conversational question about Lunch Bot.
+
+        This method may explain state and supported commands, but it must never
+        be used to authorize or perform a mutation. Command routing remains
+        deterministic in :mod:`lunch_bot.commands`.
+        """
+        system = (
+            "You are Lunch Bot, a concise and friendly assistant for a reading "
+            "group's lunch polls. Answer the user's question using the supplied "
+            "context. Never claim that you created a poll, added a restaurant, "
+            "cast a vote, or changed any state. If the user wants an action, "
+            "explain the explicit command they should use. Do not invent "
+            "restaurants, votes, schedules, or capabilities."
+        )
+        user = f"Current Lunch Bot context:\n{context}\n\nUser message:\n{text}"
+        return self._complete_text(system, user, max_tokens=300).strip()
+
 
 class AnthropicClient(LLMClient):
     """LLM backend over the Anthropic Messages API."""

@@ -68,9 +68,32 @@ CREATE TABLE IF NOT EXISTS votes (
     FOREIGN KEY (restaurant_id) REFERENCES restaurants(id)
 );
 
+CREATE TABLE IF NOT EXISTS pending_restaurant_confirmations (
+    token          TEXT PRIMARY KEY,
+    slack_user_id  TEXT NOT NULL,
+    slack_channel  TEXT NOT NULL,
+    query          TEXT NOT NULL,
+    target         TEXT NOT NULL,
+    poll_id        INTEGER,
+    name           TEXT NOT NULL,
+    cuisine        TEXT,
+    address        TEXT,
+    place_id       TEXT,
+    lat            REAL,
+    lng            REAL,
+    price_level    INTEGER,
+    source         TEXT NOT NULL DEFAULT 'suggestion',
+    status         TEXT NOT NULL DEFAULT 'pending',
+    created_at     TEXT NOT NULL,
+    resolved_at    TEXT,
+    FOREIGN KEY (poll_id) REFERENCES polls(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_restaurants_active ON restaurants(active);
 CREATE INDEX IF NOT EXISTS idx_votes_poll ON votes(poll_id);
 CREATE INDEX IF NOT EXISTS idx_poll_options_poll ON poll_options(poll_id);
+CREATE INDEX IF NOT EXISTS idx_pending_confirmation_status
+    ON pending_restaurant_confirmations(status);
 """
 
 
@@ -270,6 +293,98 @@ def set_cuisine(conn: sqlite3.Connection, restaurant_id: int, cuisine: str) -> N
     with _write_lock:
         conn.execute(
             "UPDATE restaurants SET cuisine = ? WHERE id = ?", (cuisine, restaurant_id)
+        )
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Pending restaurant confirmation helpers
+# ---------------------------------------------------------------------------
+def create_pending_restaurant_confirmation(
+    conn: sqlite3.Connection,
+    *,
+    token: str,
+    slack_user_id: str,
+    slack_channel: str,
+    query: str,
+    target: str,
+    restaurant: Restaurant,
+    poll_id: Optional[int] = None,
+) -> None:
+    """Persist a Google Places match without adding it to the restaurant pool."""
+    with _write_lock:
+        conn.execute(
+            """
+            INSERT INTO pending_restaurant_confirmations
+                (token, slack_user_id, slack_channel, query, target, poll_id,
+                 name, cuisine, address, place_id, lat, lng, price_level, source,
+                 status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            """,
+            (
+                token,
+                slack_user_id,
+                slack_channel,
+                query,
+                target,
+                poll_id,
+                restaurant.name,
+                restaurant.cuisine,
+                restaurant.address,
+                restaurant.place_id,
+                restaurant.lat,
+                restaurant.lng,
+                restaurant.price_level,
+                restaurant.source,
+                _now_iso(),
+            ),
+        )
+        conn.commit()
+
+
+def get_pending_restaurant_confirmation(
+    conn: sqlite3.Connection, token: str
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM pending_restaurant_confirmations WHERE token = ?", (token,)
+    ).fetchone()
+
+
+def claim_pending_restaurant_confirmation(
+    conn: sqlite3.Connection, token: str, slack_user_id: str
+) -> Optional[sqlite3.Row]:
+    """Atomically claim a pending match for its requesting Slack user."""
+    with _write_lock:
+        row = conn.execute(
+            "SELECT * FROM pending_restaurant_confirmations WHERE token = ?",
+            (token,),
+        ).fetchone()
+        if (
+            row is None
+            or row["slack_user_id"] != slack_user_id
+            or row["status"] != "pending"
+        ):
+            return None
+        changed = conn.execute(
+            "UPDATE pending_restaurant_confirmations SET status = 'processing' "
+            "WHERE token = ? AND slack_user_id = ? AND status = 'pending'",
+            (token, slack_user_id),
+        ).rowcount
+        conn.commit()
+        return row if changed == 1 else None
+
+
+def resolve_pending_restaurant_confirmation(
+    conn: sqlite3.Connection, token: str, status: str
+) -> None:
+    """Finish a claimed confirmation as confirmed, cancelled, or failed."""
+    if status not in {"confirmed", "cancelled", "failed"}:
+        raise ValueError(f"Invalid pending confirmation status: {status}")
+    with _write_lock:
+        conn.execute(
+            "UPDATE pending_restaurant_confirmations "
+            "SET status = ?, resolved_at = ? WHERE token = ?",
+            (status, _now_iso(), token),
         )
         conn.commit()
 

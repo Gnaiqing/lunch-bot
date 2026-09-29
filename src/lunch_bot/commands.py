@@ -64,7 +64,14 @@ def parse_mention_command(text: str) -> MentionCommand:
     text = " ".join((text or "").strip().split())
     lowered = text.casefold()
 
-    if not text or re.search(r"\b(help|commands?)\b", lowered) or "what can you do" in lowered:
+    if (
+        not text
+        or re.search(r"\b(help|commands?|capabilities|services?)\b", lowered)
+        or "what can you do" in lowered
+        or "what do you do" in lowered
+        or "who are you" in lowered
+        or "introduce yourself" in lowered
+    ):
         return MentionCommand("help")
 
     if re.search(r"\b(list|show|what|which)\b.*\b(restaurants?|candidates?|pool)\b", lowered) and not re.search(
@@ -100,19 +107,27 @@ def parse_mention_command(text: str) -> MentionCommand:
         return MentionCommand("add_to_poll", queries=_split_queries(add_to_poll.group(1)))
 
     add_to_pool = re.search(
-        r"\badd\s+(.+?)\s+to\s+(?:the\s+)?(?:candidate\s+list|restaurant\s+pool|candidates?|pool)\b",
+        r"\badd\s+(?:restaurant\s+)?(.+?)\s+to\s+(?:the\s+)?"
+        r"(?:candidate\s+list|restaurant\s+(?:list|pool)|candidates?|list|pool)\b",
         text,
         re.I,
     )
     if add_to_pool:
         return MentionCommand("add_to_pool", queries=_split_queries(add_to_pool.group(1)))
 
-    suggestion = re.search(r"\b(?:suggest|try|add)\s+(.+?)(?:[.!?]|$)", text, re.I)
-    if suggestion:
-        return MentionCommand("add_to_pool", queries=[_clean_query(suggestion.group(1))])
+    explicit_suggestion_patterns = (
+        r"\brestaurant\s+suggestion\s*:\s*(.+?)(?:[.!?]|$)",
+        r"\bsuggest\s+(?:the\s+)?restaurant\s+(.+?)(?:[.!?]|$)",
+        r"\bsuggest\s+(.+?)\s+as\s+(?:a\s+)?restaurant(?:[.!?]|$)",
+    )
+    for pattern in explicit_suggestion_patterns:
+        suggestion = re.search(pattern, text, re.I)
+        if suggestion:
+            return MentionCommand("add_to_pool", queries=[_clean_query(suggestion.group(1))])
 
-    # Backward compatibility: a bare mention is treated as a restaurant name.
-    return MentionCommand("add_to_pool", queries=[text])
+    # Unknown text is deliberately non-mutating. Restaurant additions must use
+    # an explicit verb such as "add", "suggest", or "try".
+    return MentionCommand("conversation")
 
 
 def match_restaurants(restaurants: list[Restaurant], query: str) -> list[Restaurant]:
@@ -127,11 +142,10 @@ def match_restaurants(restaurants: list[Restaurant], query: str) -> list[Restaur
     exact = [restaurant for restaurant in restaurants if normal(restaurant.name) == needle]
     if exact:
         return exact
-    query_words = set(needle.split())
     by_cuisine = [
         restaurant
         for restaurant in restaurants
-        if normal(restaurant.cuisine) in query_words or normal(restaurant.cuisine) == needle
+        if normal(restaurant.cuisine) == needle
     ]
     if by_cuisine:
         return by_cuisine
