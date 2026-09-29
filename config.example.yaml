@@ -1,0 +1,60 @@
+# Non-secret configuration for lunch-bot.
+# Copy to `config.yaml` (gitignored) and adjust. Environment variables override
+# any value set here. Secrets (tokens, API keys) belong in `.env`, NOT here.
+
+# Slack channel id (not name). Default below is the PRODUCTION channel
+# #dl-time-series-tabular (C03J1AVLGFM).
+# For TESTING, set this to the test channel #thoughts-on-lunch (C0C4DT9J75Z).
+slack_channel_id: "C03J1AVLGFM"
+# Human-readable channel name, shown in some messages (display only).
+slack_channel_name: "#dl-time-series-tabular"
+
+# Office location. If google_maps_api_key is set, the address is geocoded at
+# runtime; office_lat/office_lng are used as a fallback and default.
+office_address: "661 University Ave, Toronto"
+office_lat: 43.6579
+office_lng: -79.3883
+
+# Nearby Search radius in metres (default 5 km).
+search_radius_m: 5000
+
+# Number of restaurants offered per poll (keep within 4..6).
+poll_size: 5
+
+# Coarse budget proxy. Google Places only exposes price_level 0..4; we filter to
+# restaurants with price_level <= this value (default 2) to stay within the
+# ~$30/person budget. Restaurants with an unknown price_level are kept.
+max_price_level: 2
+
+# UCB-style exploration weight for the selection algorithm. Higher => explore
+# rarely/never-offered restaurants more aggressively.
+exploration_c: 1.0
+
+# SQLite database file path (gitignored).
+db_path: "lunch_bot.db"
+
+# LLM provider for cuisine tagging + free-text suggestion parsing.
+# One of: "anthropic" (Claude) or "openai" (GPT). Only the SELECTED provider's
+# API key is required — set it in .env (ANTHROPIC_API_KEY or OPENAI_API_KEY).
+llm_provider: "anthropic"
+# Small/fast per-provider models. Only the one for llm_provider is used.
+anthropic_model: "claude-haiku-4-5"
+openai_model: "gpt-4o-mini"
+
+# Candidate source for the seed script. Point a different reading group at its
+# own restaurant list here (env RESTAURANTS_CSV overrides this).
+restaurants_csv: "data/restaurants_seed.csv"
+
+# Scheduling. All times are local to `timezone`. Each phase has a weekday
+# (mon/tue/.../sun, or a full name) and an "HH:MM" 24-hour time.
+#   poll_create    — post the poll, open voting
+#   poll_close     — close the poll, tally + record votes, announce the winner
+#   order_reminder — remind the group to place their orders on the group-order link
+#   order_deadline — INFORMATIONAL ONLY (no bot job): when the organizer closes
+#                    the link and places the order (a human step)
+timezone: "America/Toronto"
+schedule:
+  poll_create:    { day: mon, time: "10:00" }
+  poll_close:     { day: wed, time: "10:00" }
+  order_reminder: { day: thu, time: "10:00" }
+  order_deadline: { day: thu, time: "11:00" }

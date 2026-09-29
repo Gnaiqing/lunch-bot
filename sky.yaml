@@ -1,0 +1,47 @@
+# SkyPilot deployment spec for lunch-bot.
+#
+# Runs the bot as a long-lived process on a lab compute-cluster node. The bot
+# uses Slack Socket Mode, so NO public URL / open port is required.
+#
+# Launch:
+#     sky launch -c lunch-bot sky.yaml
+#
+# The task reads secrets from environment variables. Provide them at launch via
+# `--env` flags or a local `.env` that you sync up (see `file_mounts` below).
+# Do NOT commit real secrets into this file.
+
+name: lunch-bot
+
+resources:
+  # Minimal CPU node — the bot is I/O bound, no GPU needed.
+  cpus: 1+
+  memory: 2+
+  # Restart the managed job if the node/spot instance is reclaimed.
+  # (For a spot instance add: use_spot: true)
+
+# Sync the repo to the remote node.
+workdir: .
+
+# Optionally sync a local .env so the process can read secrets from it.
+# Comment this out if you pass secrets via `--env` instead.
+file_mounts:
+  /lunch-bot/.env: .env
+
+setup: |
+  echo "Setting up lunch-bot environment…"
+  python3 -m pip install --upgrade pip
+  pip install -r requirements.txt
+
+run: |
+  echo "Starting lunch-bot (Socket Mode)…"
+  # Load .env if it was synced, then run the bot as a module.
+  set -a
+  [ -f /lunch-bot/.env ] && . /lunch-bot/.env
+  set +a
+  export PYTHONPATH="$(pwd)/src:${PYTHONPATH}"
+  python -m lunch_bot.main
+
+# Non-secret knobs can also be provided here and overridden at launch with --env.
+envs:
+  DB_PATH: lunch_bot.db
+  TIMEZONE: America/Toronto
