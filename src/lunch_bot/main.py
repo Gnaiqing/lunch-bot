@@ -12,11 +12,21 @@ starts — which is the intended behaviour for a long-lived service.
 from __future__ import annotations
 
 import logging
+import sys
 
 from . import db
 from .config import load_config
 
 logger = logging.getLogger(__name__)
+
+# Config attributes that must be set before the bot can start, mapped to the
+# environment variable a user actually sets them with.
+REQUIRED_SETTINGS = {
+    "slack_bot_token": "SLACK_BOT_TOKEN",
+    "slack_app_token": "SLACK_APP_TOKEN",
+    "slack_signing_secret": "SLACK_SIGNING_SECRET",
+    "slack_channel_id": "SLACK_CHANNEL_ID",
+}
 
 
 def main() -> None:
@@ -24,12 +34,16 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     config = load_config()
-    config.require(
-        "slack_bot_token",
-        "slack_app_token",
-        "slack_signing_secret",
-        "slack_channel_id",
-    )
+    missing = [env for attr, env in REQUIRED_SETTINGS.items() if not getattr(config, attr, None)]
+    if missing:
+        print(
+            "lunch-bot: cannot start — missing required configuration.\n"
+            "Set the following environment variable(s) (in .env or your shell): "
+            + ", ".join(sorted(missing))
+            + ".\nSee SETUP.md and .env.example for how to obtain each value.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
 
     conn = db.init_db(config.db_path)
     logger.info("Initialised database at %s", config.db_path)
