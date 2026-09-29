@@ -1,0 +1,12 @@
+# Runtime dependencies for lunch-bot (pinned-ish for easy `pip install -r`).
+# See pyproject.toml for canonical metadata.
+
+slack-bolt>=1.18,<2
+apscheduler>=3.10,<4
+googlemaps>=4.10,<5
+anthropic>=0.40
+python-dotenv>=1.0,<2
+PyYAML>=6.0,<7
+
+# Dev / test (optional):
+pytest>=7.4

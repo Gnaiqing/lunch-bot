@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lunch-bot"
+version = "0.1.0"
+description = "A Slack bot that runs a weekly lunch-decision workflow for the #thoughts-on-lunch channel."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "gnaiqing", email = "gnaiqing@gmail.com" }]
+keywords = ["slack", "bot", "lunch", "poll", "google-places", "uber-eats"]
+
+dependencies = [
+    "slack-bolt>=1.18",
+    "apscheduler>=3.10,<4",
+    "googlemaps>=4.10",
+    "anthropic>=0.40",
+    "python-dotenv>=1.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+]
+
+[project.scripts]
+lunch-bot = "lunch_bot.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

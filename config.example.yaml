@@ -1,0 +1,38 @@
+# Non-secret configuration for lunch-bot.
+# Copy to `config.yaml` (gitignored) and adjust. Environment variables override
+# any value set here. Secrets (tokens, API keys) belong in `.env`, NOT here.
+
+# Slack channel id (not name) of #thoughts-on-lunch.
+slack_channel_id: "C0123456789"
+
+# Office location. If google_maps_api_key is set, the address is geocoded at
+# runtime; office_lat/office_lng are used as a fallback and default.
+office_address: "661 University Ave, Toronto"
+office_lat: 43.6579
+office_lng: -79.3883
+
+# Nearby Search radius in metres (default 5 km).
+search_radius_m: 5000
+
+# Number of restaurants offered per poll (keep within 4..6).
+poll_size: 5
+
+# Coarse budget proxy. Google Places only exposes price_level 0..4; we filter to
+# restaurants with price_level <= this value (default 2) to stay within the
+# ~$30/person budget. Restaurants with an unknown price_level are kept.
+max_price_level: 2
+
+# UCB-style exploration weight for the selection algorithm. Higher => explore
+# rarely/never-offered restaurants more aggressively.
+exploration_c: 1.0
+
+# SQLite database file path (gitignored).
+db_path: "lunch_bot.db"
+
+# Small/fast model for cuisine tagging + free-text suggestion parsing.
+llm_model: "claude-haiku-4-5"
+
+# Scheduling (times are local to `timezone`).
+timezone: "America/Toronto"
+monday_hour: 10      # Monday: create + post the poll
+thursday_hour: 11    # Thursday: announce winner + prep the order
