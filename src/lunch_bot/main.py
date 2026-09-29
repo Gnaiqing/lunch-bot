@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import logging
 import sys
+from typing import Optional
 
 from . import db
-from .config import load_config
+from .config import Config, load_config
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,32 @@ REQUIRED_SETTINGS = {
     "slack_signing_secret": "SLACK_SIGNING_SECRET",
     "slack_channel_id": "SLACK_CHANNEL_ID",
 }
+
+# The LLM is optional, but when enabled it needs the API key for the ACTIVE
+# provider (``config.llm_provider``). Only that provider's key is relevant; the
+# other provider's key is never required. Maps provider -> (config attr, env var).
+LLM_PROVIDER_KEYS = {
+    "anthropic": ("anthropic_api_key", "ANTHROPIC_API_KEY"),
+    "openai": ("openai_api_key", "OPENAI_API_KEY"),
+}
+
+
+def active_llm_api_key(config: Config) -> Optional[str]:
+    """Return the API key value for the active LLM provider (or ``None``)."""
+    attr, _env = LLM_PROVIDER_KEYS[config.llm_provider]
+    return getattr(config, attr, None)
+
+
+def missing_llm_key_env(config: Config) -> Optional[str]:
+    """Return the env-var name of the active provider's key if it is unset.
+
+    The LLM is optional, so a missing key does not stop startup — this just names
+    which key to set to enable the LLM. Only the ACTIVE provider's key matters;
+    the other provider's key is never required.
+    """
+    if active_llm_api_key(config):
+        return None
+    return LLM_PROVIDER_KEYS[config.llm_provider][1]
 
 
 def main() -> None:
@@ -49,16 +76,23 @@ def main() -> None:
     logger.info("Initialised database at %s", config.db_path)
 
     # LLM is optional — the bot still runs without it (cuisine tagging + free-text
-    # suggestion parsing degrade gracefully).
+    # suggestion parsing degrade gracefully). When enabled, only the ACTIVE
+    # provider's key is required.
     llm = None
-    if config.anthropic_api_key:
+    if active_llm_api_key(config):
         try:
-            from .llm import LLMClient
+            from .llm import build_llm_client
 
-            llm = LLMClient(api_key=config.anthropic_api_key, model=config.llm_model)
-            logger.info("LLM enabled (model=%s)", config.llm_model)
+            llm = build_llm_client(config)
+            logger.info("LLM enabled (provider=%s, model=%s)", config.llm_provider, llm.model)
         except Exception as exc:  # pragma: no cover
             logger.warning("LLM unavailable (%s); continuing without it.", exc)
+    else:
+        logger.info(
+            "LLM disabled: no API key for provider %r — set %s to enable "
+            "cuisine tagging + suggestion parsing.",
+            config.llm_provider, missing_llm_key_env(config),
+        )
 
     from .scheduler import build_scheduler
     from .slack_app import build_app

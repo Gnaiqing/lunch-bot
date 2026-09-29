@@ -76,17 +76,31 @@ channel id (`SLACK_CHANNEL_ID`).
 5. *(Recommended)* Restrict the key to just those two APIs (Places API +
    Geocoding API).
 
-## 5. Anthropic key → `ANTHROPIC_API_KEY`
+## 5. LLM provider key → `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`
+
+The LLM (used for cuisine tagging and parsing free-text suggestions) is
+**optional** — the bot still starts and runs without it, degrading those two
+features gracefully.
+
+Choose a provider with **`LLM_PROVIDER`** (`anthropic` or `openai`, default
+`anthropic`). Only the **selected** provider's key is required; the other is not.
+
+**Option A — Anthropic (default):**
 
 1. Go to <https://console.anthropic.com>.
 2. Add **billing credit** to the account.
 3. **API Keys → Create Key.** Copy the key (starts with `sk-ant-`) — it is
    **shown only once**. This is your **`ANTHROPIC_API_KEY`**.
+   The default model is `claude-haiku-4-5`, overridable via `ANTHROPIC_MODEL`.
 
-The LLM (used for cuisine tagging and parsing free-text suggestions) is
-**optional** — the bot still starts and runs without it, degrading those two
-features gracefully. The default model is `claude-haiku-4-5`, overridable via
-`LLM_MODEL`.
+**Option B — OpenAI:**
+
+1. Set `LLM_PROVIDER=openai`.
+2. Go to <https://platform.openai.com/api-keys> and add billing credit.
+3. Create a key (starts with `sk-`) → **`OPENAI_API_KEY`**.
+   The default model is `gpt-4o-mini`, overridable via `OPENAI_MODEL`.
+
+To switch providers later, change `LLM_PROVIDER` and supply that provider's key.
 
 ## 6. Configure
 
@@ -114,10 +128,13 @@ Secrets come from `.env` (or the shell). Non-secret knobs can live in `.env`
 | `SLACK_APP_TOKEN`      | yes     | App-level token for Socket Mode (`xapp-…`, scope `connections:write`). **Required to start.** |
 | `SLACK_SIGNING_SECRET` | yes     | Slack app signing secret (Basic Information). **Required to start.** |
 | `GOOGLE_MAPS_API_KEY`  | yes     | Google API key with Places API + Geocoding API enabled. Needed for restaurant discovery. |
-| `ANTHROPIC_API_KEY`    | yes     | Anthropic API key (`sk-ant-…`). Optional; enables cuisine tagging + suggestion parsing. |
+| `ANTHROPIC_API_KEY`    | yes     | Anthropic API key (`sk-ant-…`). Required only when `LLM_PROVIDER=anthropic`; enables cuisine tagging + suggestion parsing. |
+| `OPENAI_API_KEY`       | yes     | OpenAI API key (`sk-…`). Required only when `LLM_PROVIDER=openai`; enables cuisine tagging + suggestion parsing. |
 | `SLACK_CHANNEL_ID`     | no      | Target channel id (`C…`), not the name. Default `C03J1AVLGFM` (#dl-time-series-tabular, production); use `C0C4DT9J75Z` (#thoughts-on-lunch) for testing. |
 | `SLACK_CHANNEL_NAME`   | no      | Human-readable channel name for display in messages (default `#dl-time-series-tabular`). |
-| `LLM_MODEL`            | no      | Model for tagging/parsing (default `claude-haiku-4-5`). |
+| `LLM_PROVIDER`         | no      | LLM provider: `anthropic` (default) or `openai`. Selects which key/model is used. |
+| `ANTHROPIC_MODEL`      | no      | Anthropic model for tagging/parsing (default `claude-haiku-4-5`). Legacy `LLM_MODEL` still honored. |
+| `OPENAI_MODEL`         | no      | OpenAI model for tagging/parsing (default `gpt-4o-mini`). |
 | `OFFICE_ADDRESS`       | no      | Office address used for discovery/geocoding (default `661 University Ave, Toronto`). |
 | `OFFICE_LAT`           | no      | Office latitude (default `43.6579`). |
 | `OFFICE_LNG`           | no      | Office longitude (default `-79.3883`). |

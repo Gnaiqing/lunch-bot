@@ -46,7 +46,7 @@ APScheduler  ─────────┤
                       ├─ selection.py   diversity + vote-weighted UCB sampling  (PURE, unit-tested)
                       ├─ polls.py       Block Kit poll build + vote handling + tally
                       ├─ ubereats.py    order summary + Uber Eats link (NO automation)
-                      ├─ llm.py         Anthropic (Claude Haiku) cuisine tag + suggestion parse
+                      ├─ llm.py         Anthropic (Claude) or OpenAI (GPT) cuisine tag + suggestion parse
                       ├─ db.py          SQLite schema + query helpers (stdlib sqlite3)
                       ├─ models.py      Restaurant / Poll / Vote dataclasses
                       └─ config.py      env + config.yaml -> Config dataclass
@@ -58,8 +58,10 @@ APScheduler  ─────────┤
   poll close+announce / order reminder).
 - **Storage:** SQLite via the stdlib `sqlite3` (single file, path configurable, gitignored).
 - **Discovery:** Google Places Nearby Search + Geocoding (`googlemaps`).
-- **LLM:** Anthropic `anthropic` SDK, `claude-haiku-4-5` (fast/cheap) for cuisine
-  tagging and parsing free-text restaurant suggestions.
+- **LLM:** pluggable provider (`llm_provider`) — Anthropic `anthropic` SDK
+  (`claude-haiku-4-5`, default) or OpenAI `openai` SDK (`gpt-4o-mini`), both
+  fast/cheap, for cuisine tagging and parsing free-text restaurant suggestions.
+  Only the selected provider's API key is needed.
 - **Deploy:** a lab compute cluster via **SkyPilot** (`sky.yaml`).
 
 ## Selection algorithm
@@ -149,10 +151,18 @@ App-level token scope summary: `connections:write` (Socket Mode) + bot scopes
 2. Enable **Places API** and **Geocoding API**.
 3. Create an API key → `GOOGLE_MAPS_API_KEY`. Restrict it to those APIs.
 
-### 3. Anthropic key
+### 3. LLM provider key (Anthropic or OpenAI)
 
-1. Get a key at <https://console.anthropic.com/> → `ANTHROPIC_API_KEY`.
-2. The default model is `claude-haiku-4-5` (fast/cheap), overridable via `LLM_MODEL`.
+Pick a provider with `LLM_PROVIDER` (`anthropic` or `openai`, default `anthropic`).
+Only the selected provider's key is required; the LLM is optional overall.
+
+- **Anthropic:** get a key at <https://console.anthropic.com/> → `ANTHROPIC_API_KEY`.
+  Model defaults to `claude-haiku-4-5` (fast/cheap), overridable via `ANTHROPIC_MODEL`.
+- **OpenAI:** get a key at <https://platform.openai.com/api-keys> → `OPENAI_API_KEY`.
+  Model defaults to `gpt-4o-mini` (small/cheap), overridable via `OPENAI_MODEL`.
+
+To switch providers, set `LLM_PROVIDER` to the other value and provide that
+provider's key.
 
 ### 4. Configure
 

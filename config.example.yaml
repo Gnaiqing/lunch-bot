@@ -33,8 +33,13 @@ exploration_c: 1.0
 # SQLite database file path (gitignored).
 db_path: "lunch_bot.db"
 
-# Small/fast model for cuisine tagging + free-text suggestion parsing.
-llm_model: "claude-haiku-4-5"
+# LLM provider for cuisine tagging + free-text suggestion parsing.
+# One of: "anthropic" (Claude) or "openai" (GPT). Only the SELECTED provider's
+# API key is required — set it in .env (ANTHROPIC_API_KEY or OPENAI_API_KEY).
+llm_provider: "anthropic"
+# Small/fast per-provider models. Only the one for llm_provider is used.
+anthropic_model: "claude-haiku-4-5"
+openai_model: "gpt-4o-mini"
 
 # Candidate source for the seed script. Point a different reading group at its
 # own restaurant list here (env RESTAURANTS_CSV overrides this).

@@ -1,18 +1,24 @@
-"""Anthropic (Claude) client wrapper.
+"""LLM client wrappers for cuisine tagging + suggestion parsing.
 
-Two small jobs, both well-suited to a fast/cheap Haiku-class model:
+Two small jobs, both well-suited to a fast/cheap model:
 
 1. **Cuisine tagging** — classify a restaurant into a single cuisine label.
 2. **Suggestion parsing** — extract a restaurant name (and optional location
    hint) from a free-text Slack message that @-mentions the bot.
 
-Model IDs and SDK usage follow the ``claude-api`` skill guidance. The default
-model is ``claude-haiku-4-5`` (the current Haiku-class model), configurable via
-:class:`lunch_bot.config.Config`.
+Two providers are supported behind one provider-agnostic interface: **Anthropic**
+(Claude) and **OpenAI**. The shared prompt-building and response-parsing logic
+lives on the :class:`LLMClient` base class; each backend only implements a small
+``_complete_text`` method. :func:`build_llm_client` returns the right backend for
+``config.llm_provider``.
 
-The ``anthropic`` import is done lazily inside :class:`LLMClient` so that modules
-which merely import this file (or the wider package) don't require the SDK to be
-installed unless the LLM is actually used.
+Anthropic model IDs and the Messages API usage follow the ``claude-api`` skill
+guidance; the default Anthropic model is ``claude-haiku-4-5`` (the current
+Haiku-class model). The default OpenAI model is ``gpt-4o-mini`` (small/cheap).
+
+The provider SDK imports (``anthropic`` / ``openai``) are done lazily inside each
+backend's constructor so that modules which merely import this file (or the wider
+package) don't require an SDK to be installed unless the LLM is actually used.
 """
 
 from __future__ import annotations
@@ -29,34 +35,26 @@ CUISINE_LABELS = [
     "cafe", "bakery", "seafood", "bbq", "other",
 ]
 
+# Default per-provider models. Anthropic: current Haiku-class model (fast/cheap,
+# per the ``claude-api`` skill). OpenAI: a small, cheap current model.
+DEFAULT_ANTHROPIC_MODEL = "claude-haiku-4-5"
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+
 
 class LLMClient:
-    """Thin wrapper over the Anthropic Messages API for tagging + parsing."""
+    """Provider-agnostic base: the shared tagging + parsing logic.
 
-    def __init__(self, api_key: Optional[str] = None, model: str = "claude-haiku-4-5"):
-        """Create the client.
+    Concrete backends (:class:`AnthropicClient`, :class:`OpenAIClient`) implement
+    :meth:`_complete_text` for a specific provider. The cuisine/suggestion prompt
+    building and response parsing live here so they are defined exactly once.
+    """
 
-        Args:
-            api_key: Anthropic API key. If ``None``, the SDK resolves credentials
-                from the environment (``ANTHROPIC_API_KEY`` etc.).
-            model: Model ID; defaults to the current Haiku-class model.
-        """
-        import anthropic  # lazy import — optional dependency
-
+    def __init__(self, model: str):
         self.model = model
-        # Passing api_key=None lets the SDK use its normal env-based resolution.
-        self._client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
 
     def _complete_text(self, system: str, user: str, *, max_tokens: int = 256) -> str:
-        """Run a single non-streaming completion and return concatenated text."""
-        resp = self._client.messages.create(
-            model=self.model,
-            max_tokens=max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-        )
-        parts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
-        return "".join(parts).strip()
+        """Run a single non-streaming completion and return the plain text reply."""
+        raise NotImplementedError
 
     def classify_cuisine(self, name: str, address: Optional[str] = None) -> str:
         """Return a single cuisine label for a restaurant.
@@ -98,6 +96,101 @@ class LLMClient:
         )
         raw = self._complete_text(system, text, max_tokens=128)
         return _safe_parse_suggestion(raw)
+
+
+class AnthropicClient(LLMClient):
+    """LLM backend over the Anthropic Messages API."""
+
+    def __init__(self, api_key: Optional[str] = None, model: str = DEFAULT_ANTHROPIC_MODEL):
+        """Create the client.
+
+        Args:
+            api_key: Anthropic API key. If ``None``, the SDK resolves credentials
+                from the environment (``ANTHROPIC_API_KEY`` etc.).
+            model: Model ID; defaults to the current Haiku-class model.
+        """
+        import anthropic  # lazy import — optional dependency
+
+        super().__init__(model)
+        # Passing api_key=None lets the SDK use its normal env-based resolution.
+        self._client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
+
+    def _complete_text(self, system: str, user: str, *, max_tokens: int = 256) -> str:
+        resp = self._client.messages.create(
+            model=self.model,
+            max_tokens=max_tokens,
+            temperature=0,  # deterministic tagging/parsing
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        parts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
+        return "".join(parts).strip()
+
+
+class OpenAIClient(LLMClient):
+    """LLM backend over the OpenAI Chat Completions API."""
+
+    def __init__(self, api_key: Optional[str] = None, model: str = DEFAULT_OPENAI_MODEL):
+        """Create the client.
+
+        Args:
+            api_key: OpenAI API key. If ``None``, the SDK resolves credentials
+                from the environment (``OPENAI_API_KEY`` etc.).
+            model: Model ID; defaults to a small, cheap current model.
+        """
+        from openai import OpenAI  # lazy import — optional dependency
+
+        super().__init__(model)
+        # Passing api_key=None lets the SDK use its normal env-based resolution.
+        self._client = OpenAI(api_key=api_key) if api_key else OpenAI()
+
+    def _complete_text(self, system: str, user: str, *, max_tokens: int = 256) -> str:
+        resp = self._client.chat.completions.create(
+            model=self.model,
+            max_tokens=max_tokens,
+            temperature=0,  # deterministic tagging/parsing
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        )
+        content = resp.choices[0].message.content or ""
+        return content.strip()
+
+
+# Provider name -> backend class. Used by the factory and (in tests) to assert
+# the class selection without instantiating a network client.
+_PROVIDER_CLASSES: dict[str, type[LLMClient]] = {
+    "anthropic": AnthropicClient,
+    "openai": OpenAIClient,
+}
+
+
+def llm_client_class(provider: str) -> type[LLMClient]:
+    """Return the backend class for ``provider`` without instantiating it.
+
+    Raises ``ValueError`` on an unknown provider.
+    """
+    try:
+        return _PROVIDER_CLASSES[provider]
+    except KeyError:
+        raise ValueError(
+            f"Unknown llm_provider: {provider!r}. "
+            f"Use one of: {', '.join(sorted(_PROVIDER_CLASSES))}."
+        ) from None
+
+
+def build_llm_client(config) -> LLMClient:
+    """Return the LLM backend for ``config.llm_provider``, wired with its key+model.
+
+    The selected provider's API key and model are read from ``config``; the other
+    provider's settings are ignored. The heavy SDK import happens lazily inside the
+    chosen backend's constructor.
+    """
+    cls = llm_client_class(config.llm_provider)
+    if config.llm_provider == "openai":
+        return cls(api_key=config.openai_api_key, model=config.openai_model)
+    return cls(api_key=config.anthropic_api_key, model=config.anthropic_model)
 
 
 def _safe_parse_suggestion(raw: str) -> dict:

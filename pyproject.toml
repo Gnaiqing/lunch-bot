@@ -17,6 +17,7 @@ dependencies = [
     "apscheduler>=3.10,<4",
     "googlemaps>=4.10",
     "anthropic>=0.40",
+    "openai>=1.0",
     "python-dotenv>=1.0",
     "PyYAML>=6.0",
 ]

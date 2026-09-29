@@ -28,7 +28,13 @@ DEFAULT_POLL_SIZE = 5  # candidates per poll; keep within 4..6
 DEFAULT_MAX_PRICE_LEVEL = 2  # Google price_level 0..4; <=2 ~ "economic" (<= $30 pp)
 DEFAULT_EXPLORATION_C = 1.0
 DEFAULT_DB_PATH = "lunch_bot.db"
-DEFAULT_LLM_MODEL = "claude-haiku-4-5"  # small/fast model for tagging + parsing
+# LLM provider selection + per-provider defaults. Only the selected provider's
+# API key is required (validated just-in-time). Anthropic uses the current
+# Haiku-class model; OpenAI uses a small, cheap current model.
+LLM_PROVIDERS = ("anthropic", "openai")
+DEFAULT_LLM_PROVIDER = "anthropic"
+DEFAULT_ANTHROPIC_MODEL = "claude-haiku-4-5"  # small/fast model for tagging + parsing
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"  # small/cheap model for tagging + parsing
 DEFAULT_RESTAURANTS_CSV = "data/restaurants_seed.csv"  # candidate source for seeding
 
 # Channels. The PRODUCTION channel is #dl-time-series-tabular; #thoughts-on-lunch
@@ -78,6 +84,19 @@ def _as_float(value: Any, default: float) -> float:
     if value is None or value == "":
         return default
     return float(value)
+
+
+def _parse_provider(value: Any, *, field_name: str = "llm_provider") -> str:
+    """Normalise + validate the LLM provider (``anthropic`` or ``openai``).
+
+    Raises ``ValueError`` with a clear message on an unknown value.
+    """
+    key = str(value).strip().lower()
+    if key in LLM_PROVIDERS:
+        return key
+    raise ValueError(
+        f"Invalid {field_name}: {value!r}. Use one of {', '.join(LLM_PROVIDERS)}."
+    )
 
 
 def _parse_day(value: Any, *, field_name: str) -> str:
@@ -181,6 +200,7 @@ class Config:
     slack_signing_secret: Optional[str] = None
     google_maps_api_key: Optional[str] = None
     anthropic_api_key: Optional[str] = None
+    openai_api_key: Optional[str] = None
 
     # --- Non-secret knobs (env or yaml) ---
     slack_channel_id: Optional[str] = DEFAULT_SLACK_CHANNEL_ID
@@ -193,7 +213,11 @@ class Config:
     max_price_level: int = DEFAULT_MAX_PRICE_LEVEL
     exploration_c: float = DEFAULT_EXPLORATION_C
     db_path: str = DEFAULT_DB_PATH
-    llm_model: str = DEFAULT_LLM_MODEL
+    # LLM provider selection + per-provider models. Only the selected provider's
+    # API key is required (see main.py's startup validation).
+    llm_provider: str = DEFAULT_LLM_PROVIDER
+    anthropic_model: str = DEFAULT_ANTHROPIC_MODEL
+    openai_model: str = DEFAULT_OPENAI_MODEL
     restaurants_csv: str = DEFAULT_RESTAURANTS_CSV  # candidate source for seeding
 
     # Scheduling. Times are local to ``timezone``. ``schedule`` maps each phase
@@ -275,6 +299,20 @@ def load_config(
             return yaml_cfg[yaml_key]
         return default
 
+    def pick_first(env_keys: list[str], yaml_keys: list[str], default: Any) -> Any:
+        """Like :func:`pick` but tries several env/yaml keys in order.
+
+        Lets a renamed setting keep honouring its legacy name (e.g.
+        ``ANTHROPIC_MODEL`` with a ``LLM_MODEL`` fallback).
+        """
+        for env_key in env_keys:
+            if env_key in env and env[env_key] != "":
+                return env[env_key]
+        for yaml_key in yaml_keys:
+            if yaml_key in yaml_cfg and yaml_cfg[yaml_key] is not None:
+                return yaml_cfg[yaml_key]
+        return default
+
     return Config(
         # Secrets: env only.
         slack_bot_token=env.get("SLACK_BOT_TOKEN"),
@@ -282,6 +320,7 @@ def load_config(
         slack_signing_secret=env.get("SLACK_SIGNING_SECRET"),
         google_maps_api_key=env.get("GOOGLE_MAPS_API_KEY"),
         anthropic_api_key=env.get("ANTHROPIC_API_KEY"),
+        openai_api_key=env.get("OPENAI_API_KEY"),
         # Non-secret knobs: env > yaml > default.
         slack_channel_id=pick("SLACK_CHANNEL_ID", "slack_channel_id", DEFAULT_SLACK_CHANNEL_ID),
         slack_channel_name=pick("SLACK_CHANNEL_NAME", "slack_channel_name", DEFAULT_SLACK_CHANNEL_NAME),
@@ -293,7 +332,12 @@ def load_config(
         max_price_level=_as_int(pick("MAX_PRICE_LEVEL", "max_price_level", DEFAULT_MAX_PRICE_LEVEL), DEFAULT_MAX_PRICE_LEVEL),
         exploration_c=_as_float(pick("EXPLORATION_C", "exploration_c", DEFAULT_EXPLORATION_C), DEFAULT_EXPLORATION_C),
         db_path=pick("DB_PATH", "db_path", DEFAULT_DB_PATH),
-        llm_model=pick("LLM_MODEL", "llm_model", DEFAULT_LLM_MODEL),
+        llm_provider=_parse_provider(pick("LLM_PROVIDER", "llm_provider", DEFAULT_LLM_PROVIDER)),
+        # ``ANTHROPIC_MODEL``/``anthropic_model`` with a legacy ``LLM_MODEL``/``llm_model`` fallback.
+        anthropic_model=pick_first(
+            ["ANTHROPIC_MODEL", "LLM_MODEL"], ["anthropic_model", "llm_model"], DEFAULT_ANTHROPIC_MODEL
+        ),
+        openai_model=pick("OPENAI_MODEL", "openai_model", DEFAULT_OPENAI_MODEL),
         restaurants_csv=pick("RESTAURANTS_CSV", "restaurants_csv", DEFAULT_RESTAURANTS_CSV),
         timezone=pick("TIMEZONE", "timezone", DEFAULT_TIMEZONE),
         schedule=_build_schedule(yaml_cfg),

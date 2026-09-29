@@ -1,0 +1,115 @@
+"""Tests for LLM provider selection, the client factory, and startup key logic.
+
+Network-free: no real API calls. The factory's class selection is asserted
+without instantiating a network client (via :func:`llm_client_class`), and the
+Anthropic backend is only *constructed* (no request is made).
+"""
+
+import pytest
+
+from lunch_bot.config import load_config
+from lunch_bot.llm import (
+    AnthropicClient,
+    LLMClient,
+    OpenAIClient,
+    build_llm_client,
+    llm_client_class,
+)
+from lunch_bot.main import active_llm_api_key, missing_llm_key_env
+
+
+def _cfg(tmp_path, env):
+    return load_config(config_path=str(tmp_path / "none.yaml"), env=env, load_dotenv=False)
+
+
+# --- config: llm_provider parsing (default / override / invalid) ---
+
+
+def test_provider_defaults_to_anthropic(tmp_path):
+    cfg = _cfg(tmp_path, {})
+    assert cfg.llm_provider == "anthropic"
+    assert cfg.anthropic_model == "claude-haiku-4-5"
+    assert cfg.openai_model == "gpt-4o-mini"
+
+
+def test_provider_override_and_models(tmp_path):
+    cfg = _cfg(
+        tmp_path,
+        {"LLM_PROVIDER": "OpenAI", "OPENAI_MODEL": "gpt-4o", "ANTHROPIC_MODEL": "claude-x"},
+    )
+    assert cfg.llm_provider == "openai"  # normalised to lowercase
+    assert cfg.openai_model == "gpt-4o"
+    assert cfg.anthropic_model == "claude-x"
+
+
+def test_legacy_llm_model_still_sets_anthropic_model(tmp_path):
+    cfg = _cfg(tmp_path, {"LLM_MODEL": "claude-legacy"})
+    assert cfg.anthropic_model == "claude-legacy"
+
+
+def test_invalid_provider_raises(tmp_path):
+    with pytest.raises(ValueError) as exc:
+        _cfg(tmp_path, {"LLM_PROVIDER": "gemini"})
+    assert "llm_provider" in str(exc.value)
+
+
+# --- factory: correct backend class per provider (no network client) ---
+
+
+def test_llm_client_class_selection():
+    assert llm_client_class("anthropic") is AnthropicClient
+    assert llm_client_class("openai") is OpenAIClient
+    assert issubclass(AnthropicClient, LLMClient)
+    assert issubclass(OpenAIClient, LLMClient)
+
+
+def test_llm_client_class_invalid_raises():
+    with pytest.raises(ValueError):
+        llm_client_class("nope")
+
+
+def test_build_llm_client_anthropic(tmp_path):
+    # anthropic SDK is a project dependency; constructing the client makes no
+    # network call.
+    cfg = _cfg(tmp_path, {"ANTHROPIC_API_KEY": "sk-ant-test"})
+    client = build_llm_client(cfg)
+    assert isinstance(client, AnthropicClient)
+    assert client.model == "claude-haiku-4-5"
+
+
+def test_build_llm_client_openai(tmp_path):
+    pytest.importorskip("openai")  # optional at test time
+    cfg = _cfg(tmp_path, {"LLM_PROVIDER": "openai", "OPENAI_API_KEY": "sk-openai-test"})
+    client = build_llm_client(cfg)
+    assert isinstance(client, OpenAIClient)
+    assert client.model == "gpt-4o-mini"
+
+
+# --- startup: required LLM key depends on the active provider ---
+
+
+def test_startup_key_openai_selected_flags_openai_only(tmp_path):
+    # provider=openai, only the (irrelevant) anthropic key is set.
+    cfg = _cfg(tmp_path, {"LLM_PROVIDER": "openai", "ANTHROPIC_API_KEY": "sk-ant-x"})
+    assert active_llm_api_key(cfg) is None  # anthropic key does not count
+    assert missing_llm_key_env(cfg) == "OPENAI_API_KEY"
+
+
+def test_startup_key_openai_present(tmp_path):
+    cfg = _cfg(tmp_path, {"LLM_PROVIDER": "openai", "OPENAI_API_KEY": "sk-openai-x"})
+    assert active_llm_api_key(cfg) == "sk-openai-x"
+    assert missing_llm_key_env(cfg) is None
+
+
+def test_startup_key_anthropic_selected_flags_anthropic_only(tmp_path):
+    # default provider=anthropic, only the (irrelevant) openai key is set.
+    cfg = _cfg(tmp_path, {"OPENAI_API_KEY": "sk-openai-x"})
+    assert cfg.llm_provider == "anthropic"
+    assert active_llm_api_key(cfg) is None  # openai key does not count
+    assert missing_llm_key_env(cfg) == "ANTHROPIC_API_KEY"
+
+
+def test_startup_key_anthropic_present(tmp_path):
+    cfg = _cfg(tmp_path, {"ANTHROPIC_API_KEY": "sk-ant-x"})
+    assert active_llm_api_key(cfg) == "sk-ant-x"
+    assert missing_llm_key_env(cfg) is None

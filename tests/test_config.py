@@ -22,7 +22,8 @@ def test_defaults_with_empty_env(tmp_path):
     assert cfg.poll_size == DEFAULT_POLL_SIZE
     assert cfg.max_price_level == DEFAULT_MAX_PRICE_LEVEL
     assert cfg.slack_bot_token is None
-    assert cfg.llm_model == "claude-haiku-4-5"
+    assert cfg.llm_provider == "anthropic"
+    assert cfg.anthropic_model == "claude-haiku-4-5"
 
 
 def test_env_overrides_defaults(tmp_path):

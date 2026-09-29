@@ -5,6 +5,7 @@ slack-bolt>=1.18,<2
 apscheduler>=3.10,<4
 googlemaps>=4.10,<5
 anthropic>=0.40
+openai>=1.0,<2
 python-dotenv>=1.0,<2
 PyYAML>=6.0,<7
 
