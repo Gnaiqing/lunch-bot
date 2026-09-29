@@ -74,6 +74,18 @@ def parse_mention_command(text: str) -> MentionCommand:
     ):
         return MentionCommand("help")
 
+    location_patterns = (
+        r"\bwhere\s+is\s+(.+?)(?:[?!]|$)",
+        r"\b(?:address|location)\s+(?:of|for)\s+(.+?)(?:[?!]|$)",
+        r"\bgoogle\s+maps?\s+link\s+(?:for|to)\s+(.+?)(?:[?!]|$)",
+    )
+    for pattern in location_patterns:
+        location = re.search(pattern, text, re.I)
+        if location:
+            return MentionCommand(
+                "restaurant_location", queries=[_clean_query(location.group(1))]
+            )
+
     if re.search(r"\b(list|show|what|which)\b.*\b(restaurants?|candidates?|pool)\b", lowered) and not re.search(
         _POLL, lowered
     ):

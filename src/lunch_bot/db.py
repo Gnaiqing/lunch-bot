@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS restaurants (
     place_id         TEXT UNIQUE,
     lat              REAL,
     lng              REAL,
+    maps_url         TEXT,
     price_level      INTEGER,
     source           TEXT NOT NULL DEFAULT 'seed',
     active           INTEGER NOT NULL DEFAULT 1,
@@ -81,6 +82,7 @@ CREATE TABLE IF NOT EXISTS pending_restaurant_confirmations (
     place_id       TEXT,
     lat            REAL,
     lng            REAL,
+    maps_url       TEXT,
     price_level    INTEGER,
     source         TEXT NOT NULL DEFAULT 'suggestion',
     status         TEXT NOT NULL DEFAULT 'pending',
@@ -121,8 +123,36 @@ def init_db(db_path: str) -> sqlite3.Connection:
     conn = connect(db_path)
     conn.executescript(SCHEMA)
     conn.commit()
+    _ensure_restaurant_location_columns(conn)
+    _ensure_pending_confirmation_location_columns(conn)
     _migrate_votes_to_multi_select(conn)
     return conn
+
+
+def _ensure_restaurant_location_columns(conn: sqlite3.Connection) -> None:
+    """Add location metadata columns to databases created by older versions."""
+    columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info('restaurants')").fetchall()
+    }
+    if "maps_url" not in columns:
+        with _write_lock:
+            conn.execute("ALTER TABLE restaurants ADD COLUMN maps_url TEXT")
+            conn.commit()
+
+
+def _ensure_pending_confirmation_location_columns(conn: sqlite3.Connection) -> None:
+    columns = {
+        row["name"]
+        for row in conn.execute(
+            "PRAGMA table_info('pending_restaurant_confirmations')"
+        ).fetchall()
+    }
+    if "maps_url" not in columns:
+        with _write_lock:
+            conn.execute(
+                "ALTER TABLE pending_restaurant_confirmations ADD COLUMN maps_url TEXT"
+            )
+            conn.commit()
 
 
 def _migrate_votes_to_multi_select(conn: sqlite3.Connection) -> None:
@@ -191,6 +221,7 @@ def _row_to_restaurant(row: sqlite3.Row) -> Restaurant:
         place_id=row["place_id"],
         lat=row["lat"],
         lng=row["lng"],
+        maps_url=row["maps_url"],
         price_level=row["price_level"],
         source=row["source"],
         active=bool(row["active"]),
@@ -243,10 +274,14 @@ def upsert_restaurant(conn: sqlite3.Connection, r: Restaurant) -> int:
                    SET name = ?, cuisine = COALESCE(?, cuisine), address = COALESCE(?, address),
                        place_id = COALESCE(?, place_id),
                        lat = COALESCE(?, lat), lng = COALESCE(?, lng),
+                       maps_url = COALESCE(?, maps_url),
                        price_level = COALESCE(?, price_level), active = ?
                  WHERE id = ?
                 """,
-                (r.name, r.cuisine, r.address, r.place_id, r.lat, r.lng, r.price_level, int(r.active), rid),
+                (
+                    r.name, r.cuisine, r.address, r.place_id, r.lat, r.lng,
+                    r.maps_url, r.price_level, int(r.active), rid,
+                ),
             )
             conn.commit()
             return rid
@@ -254,18 +289,43 @@ def upsert_restaurant(conn: sqlite3.Connection, r: Restaurant) -> int:
         cur = conn.execute(
             """
             INSERT INTO restaurants
-                (name, cuisine, address, place_id, lat, lng, price_level, source,
+                (name, cuisine, address, place_id, lat, lng, maps_url, price_level, source,
                  active, times_selected, total_votes, last_selected_at, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                r.name, r.cuisine, r.address, r.place_id, r.lat, r.lng, r.price_level,
+                r.name, r.cuisine, r.address, r.place_id, r.lat, r.lng, r.maps_url, r.price_level,
                 r.source, int(r.active), r.times_selected, r.total_votes,
                 r.last_selected_at, created_at,
             ),
         )
         conn.commit()
         return int(cur.lastrowid)
+
+
+def update_restaurant_location(
+    conn: sqlite3.Connection, restaurant_id: int, location: Restaurant
+) -> None:
+    """Enrich one existing restaurant without changing its name or vote history."""
+    with _write_lock:
+        conn.execute(
+            """
+            UPDATE restaurants
+               SET address = ?, place_id = ?, lat = ?, lng = ?, maps_url = ?,
+                   price_level = COALESCE(?, price_level)
+             WHERE id = ?
+            """,
+            (
+                location.address,
+                location.place_id,
+                location.lat,
+                location.lng,
+                location.maps_url,
+                location.price_level,
+                restaurant_id,
+            ),
+        )
+        conn.commit()
 
 
 def get_active_restaurants(conn: sqlite3.Connection) -> list[Restaurant]:
@@ -317,9 +377,9 @@ def create_pending_restaurant_confirmation(
             """
             INSERT INTO pending_restaurant_confirmations
                 (token, slack_user_id, slack_channel, query, target, poll_id,
-                 name, cuisine, address, place_id, lat, lng, price_level, source,
+                 name, cuisine, address, place_id, lat, lng, maps_url, price_level, source,
                  status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
             """,
             (
                 token,
@@ -334,6 +394,7 @@ def create_pending_restaurant_confirmation(
                 restaurant.place_id,
                 restaurant.lat,
                 restaurant.lng,
+                restaurant.maps_url,
                 restaurant.price_level,
                 restaurant.source,
                 _now_iso(),
@@ -655,6 +716,19 @@ def tally_votes(conn: sqlite3.Connection, poll_id: int) -> dict[int, int]:
         (poll_id,),
     ).fetchall()
     return {r["restaurant_id"]: r["c"] for r in rows}
+
+
+def get_poll_voters(conn: sqlite3.Connection, poll_id: int) -> dict[int, list[str]]:
+    """Return Slack user IDs grouped by poll option in vote order."""
+    rows = conn.execute(
+        "SELECT restaurant_id, slack_user_id FROM votes "
+        "WHERE poll_id = ? ORDER BY created_at, id",
+        (poll_id,),
+    ).fetchall()
+    voters: dict[int, list[str]] = {}
+    for row in rows:
+        voters.setdefault(row["restaurant_id"], []).append(row["slack_user_id"])
+    return voters
 
 
 def apply_vote_totals_to_pool(conn: sqlite3.Connection, poll_id: int) -> None:

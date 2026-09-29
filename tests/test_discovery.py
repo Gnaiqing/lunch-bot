@@ -48,6 +48,7 @@ def test_suggestion_search_is_location_biased_and_restaurant_typed(monkeypatch):
     assert client.kwargs["location"] == (43.6579, -79.3883)
     assert client.kwargs["radius"] == 5000
     assert client.kwargs["type"] == "restaurant"
+    assert restaurant.maps_url.endswith("query_place_id=place-1")
 
 
 def test_non_food_place_is_rejected(monkeypatch):

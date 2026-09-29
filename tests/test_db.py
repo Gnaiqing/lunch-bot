@@ -121,6 +121,19 @@ def test_one_user_can_vote_for_multiple_options_and_toggle_one_off(tmp_path):
     assert db.tally_votes(conn, poll_id) == {r2: 1}
 
 
+def test_poll_voters_are_grouped_by_option(tmp_path):
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    poll_id, r1, r2 = _two_option_poll(conn)
+    db.record_vote_if_open(conn, poll_id, r1, "U1")
+    db.record_vote_if_open(conn, poll_id, r1, "U2")
+    db.record_vote_if_open(conn, poll_id, r2, "U2")
+
+    assert db.get_poll_voters(conn, poll_id) == {
+        r1: ["U1", "U2"],
+        r2: ["U2"],
+    }
+
+
 def test_init_db_migrates_legacy_single_choice_votes(tmp_path):
     path = str(tmp_path / "legacy.db")
     conn = sqlite3.connect(path)
@@ -154,6 +167,29 @@ def test_init_db_migrates_legacy_single_choice_votes(tmp_path):
     assert db.tally_votes(migrated, 1) == {1: 1}
     assert db.record_vote_if_open(migrated, 1, 2, "U1") is True
     assert db.tally_votes(migrated, 1) == {1: 1, 2: 1}
+
+
+def test_init_db_adds_maps_url_to_legacy_tables(tmp_path):
+    path = str(tmp_path / "legacy-location.db")
+    conn = sqlite3.connect(path)
+    legacy_schema = db.SCHEMA.replace("    maps_url         TEXT,\n", "").replace(
+        "    maps_url       TEXT,\n", ""
+    )
+    conn.executescript(legacy_schema)
+    conn.close()
+
+    migrated = db.init_db(path)
+    restaurant_columns = {
+        row["name"] for row in migrated.execute("PRAGMA table_info('restaurants')")
+    }
+    pending_columns = {
+        row["name"]
+        for row in migrated.execute(
+            "PRAGMA table_info('pending_restaurant_confirmations')"
+        )
+    }
+    assert "maps_url" in restaurant_columns
+    assert "maps_url" in pending_columns
 
 
 # ---------------------------------------------------------------------------

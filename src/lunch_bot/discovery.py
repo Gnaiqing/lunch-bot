@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 from typing import Optional
+from urllib.parse import urlencode
 
 from .config import Config
 from .db import set_cuisine, upsert_restaurant
@@ -45,6 +46,14 @@ def _distance_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
         + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
     )
     return earth_radius_m * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def google_maps_url(name: str, place_id: Optional[str] = None) -> str:
+    """Build a stable Google Maps search URL, preferring an exact Place ID."""
+    params = {"api": 1, "query": name}
+    if place_id:
+        params["query_place_id"] = place_id
+    return "https://www.google.com/maps/search/?" + urlencode(params)
 
 
 def _client(api_key: str):
@@ -91,6 +100,8 @@ def nearby_restaurants(config: Config, *, lat: Optional[float] = None, lng: Opti
         type="restaurant",
     )
     for place in response.get("results", []):
+        if not set(place.get("types", [])).intersection(FOOD_PLACE_TYPES):
+            continue
         price_level = place.get("price_level")
         if price_level is not None and price_level > config.max_price_level:
             continue  # too expensive for the budget
@@ -103,6 +114,9 @@ def nearby_restaurants(config: Config, *, lat: Optional[float] = None, lng: Opti
                 place_id=place.get("place_id"),
                 lat=geometry.get("lat"),
                 lng=geometry.get("lng"),
+                maps_url=google_maps_url(
+                    place.get("name", "Unknown"), place.get("place_id")
+                ),
                 price_level=price_level,
                 source="places",
             )
@@ -110,11 +124,17 @@ def nearby_restaurants(config: Config, *, lat: Optional[float] = None, lng: Opti
     return found
 
 
-def validate_suggestion(config: Config, name: str, location_hint: Optional[str] = None) -> Optional[Restaurant]:
-    """Validate a suggested restaurant name against Google Places (text search).
+def lookup_restaurant(
+    config: Config,
+    name: str,
+    location_hint: Optional[str] = None,
+    *,
+    enforce_budget: bool = True,
+) -> Optional[Restaurant]:
+    """Find a nearby food place by name without persisting it.
 
-    Returns a :class:`Restaurant` (source ``'suggestion'``) if a plausible match
-    is found within budget, else ``None``.
+    Results must be food-related and within the configured office radius.
+    ``enforce_budget=False`` is used when enriching already-approved candidates.
     """
     config.require("google_maps_api_key")
     gmaps = _client(config.google_maps_api_key)
@@ -133,7 +153,7 @@ def validate_suggestion(config: Config, name: str, location_hint: Optional[str] 
     if not place_types.intersection(FOOD_PLACE_TYPES):
         return None
     price_level = place.get("price_level")
-    if price_level is not None and price_level > config.max_price_level:
+    if enforce_budget and price_level is not None and price_level > config.max_price_level:
         return None
     geometry = place.get("geometry", {}).get("location", {})
     lat = geometry.get("lat")
@@ -149,8 +169,18 @@ def validate_suggestion(config: Config, name: str, location_hint: Optional[str] 
         place_id=place.get("place_id"),
         lat=lat,
         lng=lng,
+        maps_url=google_maps_url(place.get("name", name), place.get("place_id")),
         price_level=price_level,
         source="suggestion",
+    )
+
+
+def validate_suggestion(
+    config: Config, name: str, location_hint: Optional[str] = None
+) -> Optional[Restaurant]:
+    """Validate a new suggestion against proximity, place type, and budget."""
+    return lookup_restaurant(
+        config, name, location_hint=location_hint, enforce_budget=True
     )
 
 

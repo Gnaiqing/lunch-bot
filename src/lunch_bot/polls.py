@@ -38,21 +38,14 @@ def parse_vote_action_id(action_id: str) -> Optional[tuple[int, int]]:
         return None
 
 
-def _restaurant_label(r: Restaurant) -> str:
-    """Human label for a poll option button/line."""
-    bits = [r.name]
-    if r.cuisine:
-        bits.append(f"({r.cuisine})")
-    return " ".join(bits)
-
-
 def build_poll_blocks(
     poll_id: int,
     restaurants: list[Restaurant],
     *,
     tally: Optional[dict[int, int]] = None,
+    voters: Optional[dict[int, list[str]]] = None,
     closed: bool = False,
-    header: str = "🍽️ Lunch poll — vote for this week's pick!",
+    header: str = "🍽️ Group Lunch",
 ) -> list[dict]:
     """Build the Block Kit blocks for a poll message.
 
@@ -60,6 +53,7 @@ def build_poll_blocks(
         poll_id: The poll's DB id (encoded into button action_ids).
         restaurants: The options, in display order.
         tally: Optional ``{restaurant_id: votes}`` to render current counts.
+        voters: Optional ``{restaurant_id: [slack_user_id, ...]}`` for mentions.
         closed: If ``True``, render a closed/read-only view (no buttons).
         header: The header text.
 
@@ -67,16 +61,27 @@ def build_poll_blocks(
         A list of Block Kit block dicts suitable for ``chat_postMessage``.
     """
     tally = tally or {}
+    voters = voters or {}
+    total_selections = sum(tally.values())
     blocks: list[dict] = [
         {"type": "header", "text": {"type": "plain_text", "text": header}},
     ]
 
     for r in restaurants:
         count = tally.get(r.id, 0)
-        line = _restaurant_label(r)
-        if tally or closed:
-            line += f" — {count} vote" + ("" if count == 1 else "s")
-        section = {"type": "section", "text": {"type": "mrkdwn", "text": f"*{line}*"}}
+        cuisine = f" [{r.cuisine}]" if r.cuisine else ""
+        name = f"<{r.maps_url}|{r.name}>" if r.maps_url else r.name
+        percentage = (
+            int((count / total_selections) * 100 + 0.5) if total_selections else 0
+        )
+        bar_width = 24
+        filled = round((percentage / 100) * bar_width)
+        bar = "█" * filled + "░" * (bar_width - filled)
+        voter_mentions = ", ".join(f"<@{user_id}>" for user_id in voters.get(r.id, []))
+        text = f"*{name}{cuisine}*\n`{bar}`  |  {percentage}% ({count})"
+        if voter_mentions:
+            text += f"\n{voter_mentions}"
+        section = {"type": "section", "text": {"type": "mrkdwn", "text": text}}
         if not closed and r.id is not None:
             section["accessory"] = {
                 "type": "button",
@@ -97,7 +102,7 @@ def build_poll_blocks(
                 "elements": [
                     {
                         "type": "mrkdwn",
-                        "text": "Select as many options as you like — click an option again to remove your vote.",
+                        "text": "You may vote for multiple options — click an option again to remove your vote.",
                     }
                 ],
             }

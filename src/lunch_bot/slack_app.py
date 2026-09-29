@@ -20,7 +20,6 @@ from __future__ import annotations
 import random
 import re
 import uuid
-from urllib.parse import urlencode
 
 from . import db, polls
 from .commands import MentionCommand, match_restaurants, parse_mention_command
@@ -62,7 +61,7 @@ def build_app(config: Config, conn, llm=None):
 
     # Import here to avoid a cycle at module load; discovery pulls in googlemaps
     # only when actually called.
-    from .discovery import validate_suggestion
+    from .discovery import google_maps_url, validate_suggestion
 
     def find_restaurant_suggestion(query: str):
         """Resolve a query through Google Places without persisting anything."""
@@ -118,10 +117,9 @@ def build_app(config: Config, conn, llm=None):
             details.append(restaurant.address)
         if restaurant.price_level is not None:
             details.append(f"Google price level: {restaurant.price_level}/4")
-        maps_params = {"api": 1, "query": restaurant.name}
-        if restaurant.place_id:
-            maps_params["query_place_id"] = restaurant.place_id
-        maps_url = "https://www.google.com/maps/search/?" + urlencode(maps_params)
+        maps_url = restaurant.maps_url or google_maps_url(
+            restaurant.name, restaurant.place_id
+        )
         details.append(f"<{maps_url}|Open in Google Maps>")
         destination = "the candidate list"
         if target == "poll":
@@ -247,7 +245,10 @@ def build_app(config: Config, conn, llm=None):
             channel=poll["slack_channel"],
             ts=poll["slack_ts"],
             blocks=polls.build_poll_blocks(
-                poll_id, restaurants, tally=db.tally_votes(conn, poll_id)
+                poll_id,
+                restaurants,
+                tally=db.tally_votes(conn, poll_id),
+                voters=db.get_poll_voters(conn, poll_id),
             ),
             text="Lunch poll updated",
         )
@@ -377,6 +378,17 @@ def build_app(config: Config, conn, llm=None):
         if command.kind == "list_poll":
             say(current_poll_text())
             return
+        if command.kind == "restaurant_location":
+            restaurant = choose_from_pool(command.queries[0])
+            if restaurant is None:
+                say(f"I couldn't find '{command.queries[0]}' in the candidate list.")
+                return
+            maps_url = restaurant.maps_url or google_maps_url(
+                restaurant.name, restaurant.place_id
+            )
+            address = restaurant.address or "Address not yet available"
+            say(f"*{restaurant.name}*\n{address}\n<{maps_url}|Open in Google Maps>")
+            return
         if command.kind == "create_poll":
             handle_create_poll(command, event, say, client)
             return
@@ -472,6 +484,7 @@ def build_app(config: Config, conn, llm=None):
             place_id=claimed["place_id"],
             lat=claimed["lat"],
             lng=claimed["lng"],
+            maps_url=claimed["maps_url"],
             price_level=claimed["price_level"],
             source=claimed["source"],
         )
@@ -563,7 +576,10 @@ def build_app(config: Config, conn, llm=None):
         restaurants = [db.get_restaurant(conn, rid) for rid in option_ids]
         restaurants = [r for r in restaurants if r is not None]
         tally = db.tally_votes(conn, poll_id)
-        blocks = polls.build_poll_blocks(poll_id, restaurants, tally=tally)
+        voters = db.get_poll_voters(conn, poll_id)
+        blocks = polls.build_poll_blocks(
+            poll_id, restaurants, tally=tally, voters=voters
+        )
 
         container = body.get("container", {})
         channel = body.get("channel", {}).get("id") or config.slack_channel_id

@@ -51,6 +51,7 @@ Commands are conversational and accept either `poll` or `polly`:
 @lunch-bot create a poll with 4 choices including Pala 148
 @lunch-bot add a pizza restaurant to this week's poll
 @lunch-bot show the current poll
+@lunch-bot where is Miznon? Can you provide its Google Maps link?
 ```
 
 Creating a poll replaces any stale open poll. Adding a named restaurant first
@@ -66,6 +67,9 @@ within the configured search radius, and within the configured price level. The
 bot then shows the matched Google Maps name and address with **Confirm** and
 **Not this one** buttons. Only the requesting user can confirm, and the restaurant
 is not added to the candidate list or an open poll until that confirmation.
+Stored candidates include their verified address, coordinates, Google Place ID,
+and a place-specific Maps URL. Run `python scripts/backfill_restaurant_locations.py`
+to enrich older rows that predate these fields.
 
 ## Architecture
 
@@ -224,7 +228,8 @@ connects to Slack via Socket Mode (it blocks and runs forever).
 ## Seed the pool from CSV
 
 Provide a CSV with a header row; recognised columns (case-insensitive):
-`name` (required), `cuisine`, `address`, `place_id`, `lat`, `lng`, `price_level`.
+`name` (required), `cuisine`, `address`, `place_id`, `lat`, `lng`, `maps_url`,
+`price_level`.
 
 ```bash
 python scripts/seed_from_csv.py                     # uses config restaurants_csv
@@ -278,11 +283,13 @@ See `sky.yaml` for how secrets are provided (synced `.env` file mount, or
 ## Data model (SQLite)
 
 - `restaurants` — the pool: `name, cuisine, address, place_id (unique), lat, lng,
-  price_level, source ('seed'|'places'|'suggestion'), active, times_selected,
+  maps_url, price_level, source ('seed'|'places'|'suggestion'), active, times_selected,
   total_votes, last_selected_at, created_at`.
 - `polls` — `slack_channel, slack_ts, created_at, closes_at, status
   ('open'|'closed'), winner_restaurant_id`.
 - `poll_options` — options offered in a poll (`poll_id`, `restaurant_id`).
+- `restaurants` location metadata includes `address`, `place_id`, `lat`, `lng`,
+  and `maps_url`.
 - `votes` — `poll_id, restaurant_id, slack_user_id, created_at`, unique on
   `(poll_id, restaurant_id, slack_user_id)` so each user may select multiple
   choices but cannot duplicate a vote for the same choice.

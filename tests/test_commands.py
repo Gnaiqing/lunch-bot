@@ -28,6 +28,14 @@ def test_list_current_restaurants():
     assert parse_mention_command("what are the current restaurants available?").kind == "list_restaurants"
 
 
+def test_restaurant_location_question_extracts_name():
+    command = parse_mention_command(
+        "where is Miznon? Can you provide its google map link?"
+    )
+    assert command.kind == "restaurant_location"
+    assert command.queries == ["Miznon"]
+
+
 def test_introduction_is_help_not_restaurant_mutation():
     command = parse_mention_command("can you introduce yourself and the service you can provide?")
     assert command.kind == "help"

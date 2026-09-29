@@ -9,6 +9,7 @@ The CSV must have a header row. Recognised columns (case-insensitive):
     place_id  (optional)
     lat       (optional, float)
     lng       (optional, float)
+    maps_url  (optional)
     price_level (optional, int 0..4)
 
 Rows are inserted with ``source = 'seed'`` and de-duplicated by ``place_id`` (or
@@ -74,6 +75,7 @@ def seed(csv_path: str, db_path: str) -> int:
                 place_id=_get(row, "place_id"),
                 lat=float(lat_raw) if lat_raw else None,
                 lng=float(lng_raw) if lng_raw else None,
+                maps_url=_get(row, "maps_url", "google_maps_url"),
                 price_level=int(price_raw) if price_raw else None,
                 source="seed",
             )

@@ -123,6 +123,41 @@ def test_conversation_is_read_only_and_does_not_use_suggestion_fallback(monkeypa
     assert len(db.get_active_restaurants(conn)) == before
 
 
+def test_location_question_returns_stored_address_and_maps_link(monkeypatch, tmp_path):
+    monkeypatch.setattr("slack_bolt.App", _FakeBoltApp)
+    config = load_config(
+        env={"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_CHANNEL_ID": "C_TEST"},
+        load_dotenv=False,
+        config_path="__none__.yaml",
+    )
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    db.upsert_restaurant(
+        conn,
+        Restaurant(
+            name="Miznon",
+            cuisine="Mediterranean",
+            address="1235 Bay St., Toronto",
+            place_id="MIZNON_PLACE",
+            maps_url="https://maps.example/miznon",
+        ),
+    )
+    app = build_app(config, conn)
+    replies = []
+
+    app.events["app_mention"](
+        event={
+            "channel": "C_TEST",
+            "user": "U_REQUESTER",
+            "text": "<@U_BOT> where is Miznon? Can you provide its google map link?",
+        },
+        say=replies.append,
+        client=_FakeSlackClient(),
+    )
+
+    assert "1235 Bay St., Toronto" in replies[0]
+    assert "<https://maps.example/miznon|Open in Google Maps>" in replies[0]
+
+
 def test_new_restaurant_is_only_added_after_requester_confirms(monkeypatch, tmp_path):
     monkeypatch.setattr("slack_bolt.App", _FakeBoltApp)
     monkeypatch.setattr(

@@ -186,7 +186,8 @@ python scripts/seed_from_csv.py data/restaurants_seed.csv --db-path lunch_bot.db
 
 Rows are inserted with `source = 'seed'` and de-duplicated by `place_id` (or by
 name when no `place_id` is present). Recognised CSV columns (case-insensitive):
-`name` (required), `cuisine`, `address`, `place_id`, `lat`, `lng`, `price_level`.
+`name` (required), `cuisine`, `address`, `place_id`, `lat`, `lng`, `maps_url`,
+`price_level`.
 
 ## 8. Local dry run
 
@@ -246,6 +247,8 @@ to `timezone`.
   restaurant-suggestion commands can modify the candidate list. A new Google
   Maps match is shown to the requester for confirmation first; it is added only
   after that user clicks **Confirm**.
+- Poll results show each choice's share of all selections and mention the Slack
+  users who selected it. Restaurant names link to their stored Google Maps URL.
 - **Poll close + announce — Wed 10:00** — the bot closes the poll, tallies and
   records the votes (updating preference memory), and announces the winner. It
   prompts the **organizer** to create and post the Uber Eats **group-order** link

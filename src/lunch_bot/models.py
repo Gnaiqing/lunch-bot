@@ -26,6 +26,7 @@ class Restaurant:
     place_id: Optional[str] = None
     lat: Optional[float] = None
     lng: Optional[float] = None
+    maps_url: Optional[str] = None
     price_level: Optional[int] = None
     source: str = "seed"  # one of: 'seed' | 'places' | 'suggestion'
     active: bool = True
