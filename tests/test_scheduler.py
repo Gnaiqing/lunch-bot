@@ -173,3 +173,22 @@ def test_multiple_preexisting_open_polls_are_all_reconciled(tmp_path):
         assert db.get_poll(conn, stale_id)["status"] == "closed"
     # No winner announcement posted for any reconciled poll: only the new poll.
     assert client.calls == 1
+
+
+def test_manual_poll_size_and_required_choice(tmp_path):
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    ids = _seed(conn, n=6)
+    config = _config()
+    client = _OkClient()
+
+    poll_id = scheduler.create_weekly_poll(
+        config,
+        conn,
+        client,
+        poll_size=4,
+        required_restaurant_ids=[ids[-1]],
+    )
+
+    option_ids = db.get_poll_option_ids(conn, poll_id)
+    assert len(option_ids) == 4
+    assert ids[-1] in option_ids

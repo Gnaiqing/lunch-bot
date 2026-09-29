@@ -32,7 +32,15 @@ from .ubereats import build_order_summary
 logger = logging.getLogger(__name__)
 
 
-def create_weekly_poll(config: Config, conn, client, *, llm=None) -> int | None:
+def create_weekly_poll(
+    config: Config,
+    conn,
+    client,
+    *,
+    llm=None,
+    poll_size: int | None = None,
+    required_restaurant_ids: list[int] | None = None,
+) -> int | None:
     """Select candidates and post the poll-create-day poll to the channel.
 
     Runs a Google Places discovery pass first (when a Maps API key is
@@ -59,9 +67,15 @@ def create_weekly_poll(config: Config, conn, client, *, llm=None) -> int | None:
         logger.warning("No active restaurants in the pool; skipping poll creation.")
         return None
 
-    candidates = select_candidates(
-        active,
-        n=config.poll_size,
+    requested_size = poll_size if poll_size is not None else config.poll_size
+    required_ids = list(dict.fromkeys(required_restaurant_ids or []))
+    active_by_id = {restaurant.id: restaurant for restaurant in active}
+    required = [active_by_id[rid] for rid in required_ids if rid in active_by_id]
+    requested_size = max(requested_size, len(required))
+    remaining = [restaurant for restaurant in active if restaurant.id not in required_ids]
+    candidates = required + select_candidates(
+        remaining,
+        n=max(0, requested_size - len(required)),
         rng=random.Random(),
         exploration_c=config.exploration_c,
     )

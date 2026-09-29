@@ -59,8 +59,8 @@ class Vote:
     """A single user's vote in a poll.
 
     Mirrors a row of the ``votes`` table. Uniqueness on
-    ``(poll_id, slack_user_id)`` is enforced at the DB layer so that a user can
-    change their vote but is only counted once.
+    ``(poll_id, restaurant_id, slack_user_id)`` is enforced at the DB layer so a
+    user can select multiple options but only vote once for any one option.
     """
 
     poll_id: int

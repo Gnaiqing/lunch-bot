@@ -95,7 +95,10 @@ def build_poll_blocks(
             {
                 "type": "context",
                 "elements": [
-                    {"type": "mrkdwn", "text": "One vote per person — click again to change it."}
+                    {
+                        "type": "mrkdwn",
+                        "text": "Select as many options as you like — click an option again to remove your vote.",
+                    }
                 ],
             }
         )
@@ -132,7 +135,7 @@ def build_order_reminder_blocks(
 
 
 def handle_vote(conn, action_id: str, slack_user_id: str) -> Optional[tuple[int, int]]:
-    """Record a vote from a button click.
+    """Toggle a vote from a button click.
 
     Returns ``(poll_id, restaurant_id)`` on success, or ``None`` if the vote
     should be ignored: the action isn't a recognisable vote action, the poll is
@@ -148,9 +151,9 @@ def handle_vote(conn, action_id: str, slack_user_id: str) -> Optional[tuple[int,
     # Check-and-insert must be atomic: the status/option validation and the insert
     # run under a single DB write lock (shared with the poll-close path) so a close
     # can't slip between the check and the insert and let a late vote land after the
-    # tally. ``record_vote_if_open`` returns ``False`` for a closed/missing poll or
+    # tally. ``toggle_vote_if_open`` returns ``None`` for a closed/missing poll or
     # an invalid/forged option, which we surface as an ignored vote.
-    if not db.record_vote_if_open(conn, poll_id, restaurant_id, slack_user_id):
+    if db.toggle_vote_if_open(conn, poll_id, restaurant_id, slack_user_id) is None:
         return None
     return poll_id, restaurant_id
 

@@ -29,20 +29,41 @@ All days/times are configurable per group (defaults shown; times local to
 | When | What happens |
 |------|--------------|
 | **Mon 10:00 — poll create** | Bot selects 4–6 diverse restaurants (see below) and posts a Block Kit poll, opening voting. |
-| **Mon–Wed** | Team votes via poll buttons; votes are recorded in SQLite (one per person, changeable). |
+| **Mon–Wed** | Team votes via poll buttons; each person may select multiple choices and click one again to remove that vote. |
 | **Wed 10:00 — poll close + announce** | Bot closes the poll, tallies + records votes (updating preference memory), and announces the winner. It prompts the **organizer** to create and post the Uber Eats **group-order** link (a suggested search is included to save a lookup). |
 | **Thu 10:00 — order reminder** | Bot pings the group to place their orders on the group-order link before the deadline. |
 | **Thu 11:00 — order deadline** | **Human step (no bot job):** the organizer closes the link and places the order. |
 
 **The bot never creates or places the order.** At any time, a member can
-**@-mention the bot** to suggest a restaurant; the bot parses the free text (LLM),
-validates it via Google Places, and adds it to the pool.
+**@-mention the bot** to manage polls, inspect the candidate list, or suggest a
+restaurant. New restaurants are validated through Google Places before being
+added to the pool.
+
+## Slack commands
+
+Commands are conversational and accept either `poll` or `polly`:
+
+```text
+@lunch-bot help
+@lunch-bot show current restaurants
+@lunch-bot add Pai Northern Thai to the candidate list
+@lunch-bot create a poll with 4 choices
+@lunch-bot create a poll with 4 choices including Pala 148
+@lunch-bot add a pizza restaurant to this week's poll
+@lunch-bot show the current poll
+```
+
+Creating a poll replaces any stale open poll. Adding a named restaurant first
+uses the existing candidate pool; if it is not present, the bot validates it
+through Google Places and adds it. A cuisine request such as “pizza restaurant”
+selects a matching candidate that is not already in the poll.
 
 ## Architecture
 
 ```
 Slack (Socket Mode)  ─┐
-                      ├─ slack_app.py   app_mention (suggestions) + poll button votes
+                      ├─ slack_app.py   conversational commands + poll button votes
+                      ├─ commands.py    deterministic mention intent parsing
 APScheduler  ─────────┤
                       ├─ scheduler.py   poll_create · poll_close+announce · order_reminder
                       │
@@ -254,4 +275,5 @@ See `sky.yaml` for how secrets are provided (synced `.env` file mount, or
   ('open'|'closed'), winner_restaurant_id`.
 - `poll_options` — options offered in a poll (`poll_id`, `restaurant_id`).
 - `votes` — `poll_id, restaurant_id, slack_user_id, created_at`, unique on
-  `(poll_id, slack_user_id)` so a user's vote can change but is counted once.
+  `(poll_id, restaurant_id, slack_user_id)` so each user may select multiple
+  choices but cannot duplicate a vote for the same choice.

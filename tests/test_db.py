@@ -12,6 +12,7 @@ cover the Copilot review fixes:
 """
 
 import threading
+import sqlite3
 
 from lunch_bot import db, polls
 from lunch_bot.models import Restaurant
@@ -105,6 +106,54 @@ def test_handle_vote_rejects_invalid_option(tmp_path):
 def test_handle_vote_ignores_non_vote_action(tmp_path):
     conn = db.init_db(str(tmp_path / "lunch.db"))
     assert polls.handle_vote(conn, "not-a-vote-action", "U1") is None
+
+
+def test_one_user_can_vote_for_multiple_options_and_toggle_one_off(tmp_path):
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    poll_id, r1, r2 = _two_option_poll(conn)
+
+    assert polls.handle_vote(conn, polls.vote_action_id(poll_id, r1), "U1") == (poll_id, r1)
+    assert polls.handle_vote(conn, polls.vote_action_id(poll_id, r2), "U1") == (poll_id, r2)
+    assert db.tally_votes(conn, poll_id) == {r1: 1, r2: 1}
+
+    # Clicking the first option again removes only that selection.
+    assert polls.handle_vote(conn, polls.vote_action_id(poll_id, r1), "U1") == (poll_id, r1)
+    assert db.tally_votes(conn, poll_id) == {r2: 1}
+
+
+def test_init_db_migrates_legacy_single_choice_votes(tmp_path):
+    path = str(tmp_path / "legacy.db")
+    conn = sqlite3.connect(path)
+    legacy_schema = db.SCHEMA.replace(
+        "UNIQUE (poll_id, restaurant_id, slack_user_id)",
+        "UNIQUE (poll_id, slack_user_id)",
+    )
+    conn.executescript(legacy_schema)
+    conn.execute(
+        "INSERT INTO restaurants (name, source, active, times_selected, total_votes, created_at) "
+        "VALUES ('A', 'seed', 1, 0, 0, 'now')"
+    )
+    conn.execute(
+        "INSERT INTO restaurants (name, source, active, times_selected, total_votes, created_at) "
+        "VALUES ('B', 'seed', 1, 0, 0, 'now')"
+    )
+    conn.execute(
+        "INSERT INTO polls (slack_channel, created_at, status) VALUES ('C1', 'now', 'open')"
+    )
+    conn.execute("INSERT INTO poll_options (poll_id, restaurant_id) VALUES (1, 1)")
+    conn.execute("INSERT INTO poll_options (poll_id, restaurant_id) VALUES (1, 2)")
+    conn.execute(
+        "INSERT INTO votes (poll_id, restaurant_id, slack_user_id, created_at) "
+        "VALUES (1, 1, 'U1', 'now')"
+    )
+    conn.commit()
+    conn.close()
+
+    migrated = db.init_db(path)
+    # Existing vote survives, and the same user can now select another option.
+    assert db.tally_votes(migrated, 1) == {1: 1}
+    assert db.record_vote_if_open(migrated, 1, 2, "U1") is True
+    assert db.tally_votes(migrated, 1) == {1: 1, 2: 1}
 
 
 # ---------------------------------------------------------------------------

@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS votes (
     restaurant_id INTEGER NOT NULL,
     slack_user_id TEXT NOT NULL,
     created_at    TEXT NOT NULL,
-    UNIQUE (poll_id, slack_user_id),
+    UNIQUE (poll_id, restaurant_id, slack_user_id),
     FOREIGN KEY (poll_id) REFERENCES polls(id),
     FOREIGN KEY (restaurant_id) REFERENCES restaurants(id)
 );
@@ -98,7 +98,62 @@ def init_db(db_path: str) -> sqlite3.Connection:
     conn = connect(db_path)
     conn.executescript(SCHEMA)
     conn.commit()
+    _migrate_votes_to_multi_select(conn)
     return conn
+
+
+def _migrate_votes_to_multi_select(conn: sqlite3.Connection) -> None:
+    """Upgrade the legacy one-vote-per-user table to multi-select voting.
+
+    Older databases have a unique constraint on ``(poll_id, slack_user_id)``.
+    A multi-select poll instead needs uniqueness per user *and option*. SQLite
+    cannot alter a table-level unique constraint in place, so preserve the rows
+    while rebuilding only when the legacy index is detected.
+    """
+    unique_indexes = []
+    for index in conn.execute("PRAGMA index_list('votes')").fetchall():
+        if index["unique"]:
+            columns = tuple(
+                row["name"]
+                for row in conn.execute(
+                    f"PRAGMA index_info('{index['name']}')"
+                ).fetchall()
+            )
+            unique_indexes.append(columns)
+    if ("poll_id", "slack_user_id") not in unique_indexes:
+        return
+
+    with _write_lock:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("ALTER TABLE votes RENAME TO votes_single_choice_legacy")
+            conn.execute(
+                """
+                CREATE TABLE votes (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    poll_id       INTEGER NOT NULL,
+                    restaurant_id INTEGER NOT NULL,
+                    slack_user_id TEXT NOT NULL,
+                    created_at    TEXT NOT NULL,
+                    UNIQUE (poll_id, restaurant_id, slack_user_id),
+                    FOREIGN KEY (poll_id) REFERENCES polls(id),
+                    FOREIGN KEY (restaurant_id) REFERENCES restaurants(id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO votes (id, poll_id, restaurant_id, slack_user_id, created_at)
+                SELECT id, poll_id, restaurant_id, slack_user_id, created_at
+                  FROM votes_single_choice_legacy
+                """
+            )
+            conn.execute("DROP TABLE votes_single_choice_legacy")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_votes_poll ON votes(poll_id)")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +367,44 @@ def get_poll_option_ids(conn: sqlite3.Connection, poll_id: int) -> list[int]:
     return [r["restaurant_id"] for r in rows]
 
 
+def add_poll_option_if_open(
+    conn: sqlite3.Connection, poll_id: int, restaurant_id: int
+) -> bool:
+    """Add a restaurant to an open poll, returning whether it was newly added."""
+    with _write_lock:
+        poll = conn.execute(
+            "SELECT status FROM polls WHERE id = ?", (poll_id,)
+        ).fetchone()
+        if poll is None or poll["status"] != "open":
+            return False
+        exists = conn.execute(
+            "SELECT 1 FROM poll_options WHERE poll_id = ? AND restaurant_id = ?",
+            (poll_id, restaurant_id),
+        ).fetchone()
+        if exists is not None:
+            return False
+        conn.execute(
+            "INSERT INTO poll_options (poll_id, restaurant_id) VALUES (?, ?)",
+            (poll_id, restaurant_id),
+        )
+        conn.commit()
+        return True
+
+
+def remove_poll_option(conn: sqlite3.Connection, poll_id: int, restaurant_id: int) -> None:
+    """Remove a poll option and any votes for it (used to roll back Slack failures)."""
+    with _write_lock:
+        conn.execute(
+            "DELETE FROM votes WHERE poll_id = ? AND restaurant_id = ?",
+            (poll_id, restaurant_id),
+        )
+        conn.execute(
+            "DELETE FROM poll_options WHERE poll_id = ? AND restaurant_id = ?",
+            (poll_id, restaurant_id),
+        )
+        conn.commit()
+
+
 def get_open_poll(conn: sqlite3.Connection, slack_channel: str) -> Optional[sqlite3.Row]:
     return conn.execute(
         "SELECT * FROM polls WHERE slack_channel = ? AND status = 'open' ORDER BY id DESC LIMIT 1",
@@ -348,18 +441,14 @@ def close_poll(conn: sqlite3.Connection, poll_id: int, winner_restaurant_id: Opt
 def record_vote(
     conn: sqlite3.Connection, poll_id: int, restaurant_id: int, slack_user_id: str
 ) -> None:
-    """Record (or change) a user's vote.
-
-    The ``UNIQUE (poll_id, slack_user_id)`` constraint means a repeat vote from
-    the same user updates their existing choice rather than adding a second one.
-    """
+    """Record one of a user's selected options, preserving their other choices."""
     with _write_lock:
         conn.execute(
             """
             INSERT INTO votes (poll_id, restaurant_id, slack_user_id, created_at)
             VALUES (?, ?, ?, ?)
-            ON CONFLICT (poll_id, slack_user_id)
-            DO UPDATE SET restaurant_id = excluded.restaurant_id, created_at = excluded.created_at
+            ON CONFLICT (poll_id, restaurant_id, slack_user_id)
+            DO UPDATE SET created_at = excluded.created_at
             """,
             (poll_id, restaurant_id, slack_user_id, _now_iso()),
         )
@@ -377,8 +466,7 @@ def record_vote_if_open(
     after the tally. Returns ``True`` if the vote was recorded, or ``False`` when
     the poll is missing/closed or ``restaurant_id`` isn't one of its options.
 
-    The ``UNIQUE (poll_id, slack_user_id)`` constraint means a repeat vote from
-    the same user updates their existing choice rather than adding a second one.
+    Uniqueness is per user and option, so users can select multiple restaurants.
     """
     with _write_lock:
         poll = conn.execute(
@@ -396,13 +484,53 @@ def record_vote_if_open(
             """
             INSERT INTO votes (poll_id, restaurant_id, slack_user_id, created_at)
             VALUES (?, ?, ?, ?)
-            ON CONFLICT (poll_id, slack_user_id)
-            DO UPDATE SET restaurant_id = excluded.restaurant_id, created_at = excluded.created_at
+            ON CONFLICT (poll_id, restaurant_id, slack_user_id)
+            DO UPDATE SET created_at = excluded.created_at
             """,
             (poll_id, restaurant_id, slack_user_id, _now_iso()),
         )
         conn.commit()
         return True
+
+
+def toggle_vote_if_open(
+    conn: sqlite3.Connection, poll_id: int, restaurant_id: int, slack_user_id: str
+) -> Optional[bool]:
+    """Toggle one option for a user while a poll is open.
+
+    Returns ``True`` when selected, ``False`` when deselected, or ``None`` when
+    the poll/option is invalid or closed.
+    """
+    with _write_lock:
+        poll = conn.execute(
+            "SELECT status FROM polls WHERE id = ?", (poll_id,)
+        ).fetchone()
+        if poll is None or poll["status"] != "open":
+            return None
+        option = conn.execute(
+            "SELECT 1 FROM poll_options WHERE poll_id = ? AND restaurant_id = ?",
+            (poll_id, restaurant_id),
+        ).fetchone()
+        if option is None:
+            return None
+        existing = conn.execute(
+            "SELECT id FROM votes WHERE poll_id = ? AND restaurant_id = ? AND slack_user_id = ?",
+            (poll_id, restaurant_id, slack_user_id),
+        ).fetchone()
+        if existing is not None:
+            conn.execute("DELETE FROM votes WHERE id = ?", (existing["id"],))
+            selected = False
+        else:
+            conn.execute(
+                """
+                INSERT INTO votes (poll_id, restaurant_id, slack_user_id, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (poll_id, restaurant_id, slack_user_id, _now_iso()),
+            )
+            selected = True
+        conn.commit()
+        return selected
 
 
 def tally_votes(conn: sqlite3.Connection, poll_id: int) -> dict[int, int]:

@@ -238,8 +238,11 @@ to `timezone`.
 
 - **Poll create — Mon 10:00** — the scheduler auto-selects 4–6 diverse
   restaurants and posts the Block Kit poll to the channel, opening voting.
-- **Mon–Wed** — the team votes via the poll buttons (one vote per person,
-  changeable); anyone can @-mention the bot to suggest a new restaurant.
+- **Mon–Wed** — the team votes via the poll buttons (multiple choices per
+  person; click a selected choice again to remove it). Anyone can @-mention the
+  bot to list or add restaurant candidates, create or inspect a poll, and add a
+  restaurant or cuisine choice to the open poll. Mention `@Lunch Bot help` for
+  examples.
 - **Poll close + announce — Wed 10:00** — the bot closes the poll, tallies and
   records the votes (updating preference memory), and announces the winner. It
   prompts the **organizer** to create and post the Uber Eats **group-order** link
