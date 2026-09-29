@@ -6,13 +6,22 @@ design details, see [`README.md`](README.md).
 
 ## 1. Overview
 
-Lunch Bot is a Slack bot for the **#thoughts-on-lunch** channel that runs the
-team's weekly lunch-decision workflow: on Monday it discovers nearby restaurants
-and posts a diversity-aware Block Kit poll, records votes through the week, and
-on Thursday announces the winner and preps an Uber Eats group order for a human
-to place. It talks to Slack over **Socket Mode** (no public URL or open port
-needed) and runs as a single long-lived process on the lab compute cluster via
-**SkyPilot**.
+Lunch Bot is a Slack bot that runs a reading group's weekly lunch-decision
+workflow: on **poll-create day** (default Mon 10:00) it discovers nearby
+restaurants and posts a diversity-aware Block Kit poll; the group votes; on
+**poll-close day** (default Wed 10:00) it closes the poll, records votes, and
+announces the winner, prompting the **organizer** to create and post the Uber
+Eats group-order link; on **order-reminder day** (default Thu 10:00) it reminds
+the group to order before the organizer's deadline (default Thu 11:00, a human
+step). **The bot never creates or places the order.** It talks to Slack over
+**Socket Mode** (no public URL or open port needed) and runs as a single
+long-lived process on the lab compute cluster via **SkyPilot**.
+
+The **production** channel is **#dl-time-series-tabular** (`C03J1AVLGFM`, the
+default). **#thoughts-on-lunch** (`C0C4DT9J75Z`) is the **test** channel — set
+`SLACK_CHANNEL_ID` to it while testing. Every day/time and the channel are
+configurable, so other reading groups can run their own instance (see
+[§11](#11-reusing-for-another-reading-group)).
 
 ## 2. Prerequisites
 
@@ -48,10 +57,11 @@ channel id (`SLACK_CHANNEL_ID`).
    (starts with `xoxb-`) — this is your **`SLACK_BOT_TOKEN`**.
 7. **Basic Information → Signing Secret** → copy it — this is your
    **`SLACK_SIGNING_SECRET`**.
-8. In Slack, invite the bot to the channel: `/invite @Lunch Bot` in
-   **#thoughts-on-lunch**. Open the channel's **About** tab and copy the
-   **channel ID** (starts with `C…`) — set this as **`SLACK_CHANNEL_ID`** (the
-   id, not the name).
+8. In Slack, invite the bot to the channel: `/invite @Lunch Bot`. Open the
+   channel's **About** tab and copy the **channel ID** (starts with `C…`) — set
+   this as **`SLACK_CHANNEL_ID`** (the id, not the name). Production is
+   **#dl-time-series-tabular** (`C03J1AVLGFM`, the default); use the test channel
+   **#thoughts-on-lunch** (`C0C4DT9J75Z`) while testing.
 
 ## 4. Google Places key → `GOOGLE_MAPS_API_KEY`
 
@@ -84,8 +94,9 @@ features gracefully. The default model is `claude-haiku-4-5`, overridable via
    ```bash
    cp .env.example .env
    ```
-2. *(Optional)* Copy the non-secret config template and adjust knobs (office
-   lat/lng, search radius, channel id, poll size, max price level, schedule):
+2. *(Optional)* Copy the non-secret config template and adjust knobs (channel id
+   + name, timezone, the weekly `schedule` days/times, `restaurants_csv`, office
+   lat/lng, search radius, poll size, max price level):
    ```bash
    cp config.example.yaml config.yaml
    ```
@@ -104,7 +115,8 @@ Secrets come from `.env` (or the shell). Non-secret knobs can live in `.env`
 | `SLACK_SIGNING_SECRET` | yes     | Slack app signing secret (Basic Information). **Required to start.** |
 | `GOOGLE_MAPS_API_KEY`  | yes     | Google API key with Places API + Geocoding API enabled. Needed for restaurant discovery. |
 | `ANTHROPIC_API_KEY`    | yes     | Anthropic API key (`sk-ant-…`). Optional; enables cuisine tagging + suggestion parsing. |
-| `SLACK_CHANNEL_ID`     | no      | Channel id (`C…`) of #thoughts-on-lunch — the id, not the name. **Required to start.** |
+| `SLACK_CHANNEL_ID`     | no      | Target channel id (`C…`), not the name. Default `C03J1AVLGFM` (#dl-time-series-tabular, production); use `C0C4DT9J75Z` (#thoughts-on-lunch) for testing. |
+| `SLACK_CHANNEL_NAME`   | no      | Human-readable channel name for display in messages (default `#dl-time-series-tabular`). |
 | `LLM_MODEL`            | no      | Model for tagging/parsing (default `claude-haiku-4-5`). |
 | `OFFICE_ADDRESS`       | no      | Office address used for discovery/geocoding (default `661 University Ave, Toronto`). |
 | `OFFICE_LAT`           | no      | Office latitude (default `43.6579`). |
@@ -114,9 +126,22 @@ Secrets come from `.env` (or the shell). Non-secret knobs can live in `.env`
 | `MAX_PRICE_LEVEL`      | no      | Coarse budget ceiling, Google price_level 0–4 (default `2`). |
 | `EXPLORATION_C`        | no      | UCB exploration weight for selection (default `1.0`). |
 | `DB_PATH`              | no      | SQLite database file path (default `lunch_bot.db`). |
+| `RESTAURANTS_CSV`      | no      | Candidate source for the seed script (default `data/restaurants_seed.csv`). |
 | `TIMEZONE`             | no      | Scheduler timezone (default `America/Toronto`). |
-| `MONDAY_HOUR`          | no      | Hour (24h, local) the Monday poll is posted (default `10`). |
-| `THURSDAY_HOUR`        | no      | Hour (24h, local) the Thursday winner is announced (default `11`). |
+
+The weekly **schedule** (days + times for `poll_create`, `poll_close`,
+`order_reminder`, and the informational `order_deadline`) lives in `config.yaml`
+under a `schedule:` block — see `config.example.yaml`. Each phase takes a weekday
+(`mon`..`sun`, or a full name) and an `"HH:MM"` 24-hour time, interpreted in
+`timezone`. `order_deadline` is used only in the reminder text (the organizer
+places the order then); it is **not** a scheduled bot job. Defaults:
+
+| Phase            | Default    | Bot job? |
+|------------------|------------|:--------:|
+| `poll_create`    | Mon 10:00  | yes — post poll, open voting |
+| `poll_close`     | Wed 10:00  | yes — close poll, record votes, announce winner |
+| `order_reminder` | Thu 10:00  | yes — remind group to order |
+| `order_deadline` | Thu 11:00  | no — organizer closes link + places order (human) |
 
 > **Security note:** never commit `.env` — it is gitignored (as are `config.yaml`
 > and `*.db`). Do not paste API keys or tokens into plaintext Slack channels,
@@ -127,12 +152,14 @@ Secrets come from `.env` (or the shell). Non-secret knobs can live in `.env`
 Load the 31-restaurant starter list (15 cuisine buckets) into the SQLite pool:
 
 ```bash
-python scripts/seed_from_csv.py data/restaurants_seed.csv
+python scripts/seed_from_csv.py                          # uses config restaurants_csv
+python scripts/seed_from_csv.py data/restaurants_seed.csv  # or an explicit path
 ```
 
-The script takes the CSV path as a positional argument and writes to the DB at
-`DB_PATH` (from config/env). To target a specific DB file instead, pass
-`--db-path`:
+The CSV path is an **optional** positional argument; when omitted it falls back to
+the configured `restaurants_csv` (env/yaml/default `data/restaurants_seed.csv`).
+The script writes to the DB at `DB_PATH` (from config/env). To target a specific
+DB file instead, pass `--db-path`:
 
 ```bash
 python scripts/seed_from_csv.py data/restaurants_seed.csv --db-path lunch_bot.db
@@ -187,10 +214,36 @@ sky down lunch-bot     # tear down
 
 ## 10. Weekly flow
 
-- **Monday** — the scheduler auto-selects 4–6 diverse restaurants and posts the
-  Block Kit poll to #thoughts-on-lunch.
-- **Tuesday–Thursday** — the team votes via the poll buttons (one vote per
-  person, changeable); anyone can @-mention the bot to suggest a new restaurant.
-- **Thursday** (before the reading group) — the bot closes the poll, announces
-  the winner, and posts an Uber Eats order-prep summary and link. **A human
-  reviews it and places the actual order** — the bot never checks out.
+Defaults shown; all days/times are configurable via `schedule` (see §6) and local
+to `timezone`.
+
+- **Poll create — Mon 10:00** — the scheduler auto-selects 4–6 diverse
+  restaurants and posts the Block Kit poll to the channel, opening voting.
+- **Mon–Wed** — the team votes via the poll buttons (one vote per person,
+  changeable); anyone can @-mention the bot to suggest a new restaurant.
+- **Poll close + announce — Wed 10:00** — the bot closes the poll, tallies and
+  records the votes (updating preference memory), and announces the winner. It
+  prompts the **organizer** to create and post the Uber Eats **group-order** link
+  (a suggested search is included to save a lookup).
+- **Order reminder — Thu 10:00** — the bot pings the group to place their orders
+  on the group-order link before the deadline.
+- **Order deadline — Thu 11:00 (human step, no bot job)** — the organizer closes
+  the link and places the actual order. **The bot never creates or places the
+  order.**
+
+## 11. Reusing for another reading group
+
+Each reading group runs its **own instance** from its own config — nothing is
+hardcoded. To stand up a new group:
+
+1. Copy `config.example.yaml` to `config.yaml` and set the group's
+   `slack_channel_id` (and optional `slack_channel_name`), `timezone`, the
+   `schedule` days/times, and `restaurants_csv` (the group's candidate list).
+   Adjust `poll_size` / `max_price_level` / office knobs as desired.
+2. Copy `.env.example` to `.env` and fill in that group's Slack, Google, and
+   Anthropic secrets.
+3. Seed and run a **separate** instance:
+   ```bash
+   python scripts/seed_from_csv.py    # uses config restaurants_csv
+   python -m lunch_bot.main
+   ```

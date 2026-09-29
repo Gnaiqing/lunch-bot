@@ -1,9 +1,15 @@
 # lunch-bot
 
-A Slack bot for the team channel **#thoughts-on-lunch** that runs a weekly
-lunch-decision workflow: it discovers nearby restaurants, posts a diversity-aware
-poll, records votes, and — before a Thursday reading group — announces the winner
-and preps an Uber Eats group order for a human to place.
+A Slack bot that runs a weekly lunch-decision workflow for a reading group: it
+discovers nearby restaurants, posts a diversity-aware poll, records votes,
+announces the winner, and reminds the group to order — while the **organizer**
+(a human) creates and places the actual Uber Eats group order.
+
+The **production** channel is **#dl-time-series-tabular** (`C03J1AVLGFM`), the
+default. **#thoughts-on-lunch** (`C0C4DT9J75Z`) is the **test** channel — point
+`SLACK_CHANNEL_ID` at it while testing. The channel is fully configurable, so
+other reading groups can run their own instance (see *Reusing for another reading
+group* below).
 
 > **v1 scaffold.** This repository is the initial structure with working
 > pure-logic (selection + config) and stubs wired for live services. Places,
@@ -13,15 +19,20 @@ and preps an Uber Eats group order for a human to place.
 
 ## Weekly flow
 
-| Day        | What the bot does                                                                 |
-|------------|-----------------------------------------------------------------------------------|
-| **Monday** | Selects 4–6 diverse restaurants (see below) and posts a Block Kit poll.           |
-| **Tue–Thu**| Team votes via poll buttons; votes are recorded in SQLite (one per person).        |
-| **Thursday** (before the reading group) | Closes the poll, announces the winner, and posts an Uber Eats order-prep summary + link. **A human places the order.** |
+All days/times are configurable per group (defaults shown; times local to
+`timezone`, default `America/Toronto`):
 
-At any time, a member can **@-mention the bot** to suggest a restaurant; the bot
-parses the free text (LLM), validates it via Google Places, and adds it to the
-pool.
+| When | What happens |
+|------|--------------|
+| **Mon 10:00 — poll create** | Bot selects 4–6 diverse restaurants (see below) and posts a Block Kit poll, opening voting. |
+| **Mon–Wed** | Team votes via poll buttons; votes are recorded in SQLite (one per person, changeable). |
+| **Wed 10:00 — poll close + announce** | Bot closes the poll, tallies + records votes (updating preference memory), and announces the winner. It prompts the **organizer** to create and post the Uber Eats **group-order** link (a suggested search is included to save a lookup). |
+| **Thu 10:00 — order reminder** | Bot pings the group to place their orders on the group-order link before the deadline. |
+| **Thu 11:00 — order deadline** | **Human step (no bot job):** the organizer closes the link and places the order. |
+
+**The bot never creates or places the order.** At any time, a member can
+**@-mention the bot** to suggest a restaurant; the bot parses the free text (LLM),
+validates it via Google Places, and adds it to the pool.
 
 ## Architecture
 
@@ -29,7 +40,7 @@ pool.
 Slack (Socket Mode)  ─┐
                       ├─ slack_app.py   app_mention (suggestions) + poll button votes
 APScheduler  ─────────┤
-                      ├─ scheduler.py   Monday create_poll · Thursday announce+order
+                      ├─ scheduler.py   poll_create · poll_close+announce · order_reminder
                       │
                       ├─ discovery.py   Google Places Nearby Search + geocoding + cuisine tagging
                       ├─ selection.py   diversity + vote-weighted UCB sampling  (PURE, unit-tested)
@@ -43,7 +54,8 @@ APScheduler  ─────────┤
 
 - **Language:** Python 3.11+
 - **Slack:** `slack-bolt` in **Socket Mode** (no public URL needed).
-- **Scheduling:** `APScheduler` (Monday/Thursday cron jobs).
+- **Scheduling:** `APScheduler` (three configurable cron jobs: poll create /
+  poll close+announce / order reminder).
 - **Storage:** SQLite via the stdlib `sqlite3` (single file, path configurable, gitignored).
 - **Discovery:** Google Places Nearby Search + Geocoding (`googlemaps`).
 - **LLM:** Anthropic `anthropic` SDK, `claude-haiku-4-5` (fast/cheap) for cuisine
@@ -78,12 +90,34 @@ Target budget is **≤ $30/person**. Google Places only exposes a coarse
 `max_price_level` knob). Restaurants with an *unknown* price level are kept
 (unknown is not assumed expensive).
 
-## Uber Eats: semi-automated (by design)
+## Uber Eats: organizer-run (by design)
 
-The bot **preps** the order (a summary of the winning restaurant + an Uber Eats
-search/restaurant link) and posts it to Slack. **It never creates or places the
-order.** There is no official Uber Eats consumer group-order API, and v1 uses
-**no browser automation**. A human clicks through and checks out.
+When it announces the winner, the bot posts a summary plus a **suggested** Uber
+Eats search link (to save a lookup) and asks the **organizer** to create the Uber
+Eats **group order** and post the shareable link in the channel. **The bot never
+creates or places the order.** There is no official Uber Eats consumer
+group-order API, and v1 uses **no browser automation**. The organizer sets up the
+group order, the team adds their items, and at the deadline the organizer closes
+the link and checks out.
+
+## Reusing for another reading group
+
+Each reading group runs its **own instance** from its own config — nothing is
+hardcoded. To stand up a new group:
+
+1. Copy `config.example.yaml` to `config.yaml` and set:
+   - `slack_channel_id` (and optional `slack_channel_name`) — the group's channel.
+   - `schedule` — the group's `poll_create` / `poll_close` / `order_reminder` days
+     and times, plus the informational `order_deadline`, and `timezone`.
+   - `restaurants_csv` — the group's own candidate restaurant list.
+   - Optionally `poll_size`, `max_price_level`, and office/search knobs.
+2. Copy `.env.example` to `.env` and fill in that group's Slack/Google/Anthropic
+   secrets.
+3. Seed and run a **separate** instance:
+   ```bash
+   python scripts/seed_from_csv.py           # uses config restaurants_csv
+   python -m lunch_bot.main
+   ```
 
 ## Setup
 
@@ -101,8 +135,10 @@ order.** There is no official Uber Eats consumer group-order API, and v1 uses
 4. **Event Subscriptions:** subscribe to the `app_mention` bot event.
 5. Install the app to your workspace; copy the **Bot User OAuth Token**
    (`xoxb-…`) → `SLACK_BOT_TOKEN`, and the **Signing Secret** → `SLACK_SIGNING_SECRET`.
-6. Invite the bot to **#thoughts-on-lunch** and copy the channel **id** (not
-   name) → `SLACK_CHANNEL_ID`.
+6. Invite the bot to your channel and copy the channel **id** (not name) →
+   `SLACK_CHANNEL_ID`. Production is **#dl-time-series-tabular** (`C03J1AVLGFM`,
+   the default); use the test channel **#thoughts-on-lunch** (`C0C4DT9J75Z`) while
+   testing.
 
 App-level token scope summary: `connections:write` (Socket Mode) + bot scopes
 `app_mentions:read`, `chat:write`, `commands`, `channels:history`.
@@ -146,10 +182,14 @@ Provide a CSV with a header row; recognised columns (case-insensitive):
 `name` (required), `cuisine`, `address`, `place_id`, `lat`, `lng`, `price_level`.
 
 ```bash
-python scripts/seed_from_csv.py restaurants.csv
+python scripts/seed_from_csv.py                     # uses config restaurants_csv
+python scripts/seed_from_csv.py restaurants.csv     # or an explicit path
 # or target a specific DB file:
 python scripts/seed_from_csv.py restaurants.csv --db-path lunch_bot.db
 ```
+
+The positional CSV path is optional; when omitted it falls back to the configured
+`restaurants_csv` (default `data/restaurants_seed.csv`).
 
 Rows are de-duplicated by `place_id` (or by name when absent). Untagged cuisines
 can be filled in later by a discovery pass (`discovery.discover_and_store`).
@@ -161,8 +201,9 @@ pip install pytest
 pytest
 ```
 
-The test suite (`tests/test_selection.py`, `tests/test_config.py`) covers the
-pure logic only and needs **no** network, Slack, Google, or Anthropic
+The test suite (`tests/test_selection.py`, `tests/test_config.py`,
+`tests/test_schedule.py`) covers the pure logic and config/schedule parsing only
+and needs **no** network, Slack, Google, or Anthropic
 credentials. The pure-logic modules keep heavy imports lazy, so these tests run
 even if the Slack/Google/Anthropic packages aren't installed.
 

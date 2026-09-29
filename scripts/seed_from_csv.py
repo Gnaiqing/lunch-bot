@@ -17,10 +17,13 @@ untagged rows can be classified later by a discovery pass.
 
 Usage::
 
+    python scripts/seed_from_csv.py                     # uses config restaurants_csv
     python scripts/seed_from_csv.py restaurants.csv
     python scripts/seed_from_csv.py restaurants.csv --db-path lunch_bot.db
 
-TODO(user): provide the seed CSV of your existing restaurant list.
+The positional CSV path is optional; when omitted it falls back to the configured
+``restaurants_csv`` (env ``RESTAURANTS_CSV`` / yaml ``restaurants_csv`` / default
+``data/restaurants_seed.csv``) so a different reading group can point at its own list.
 """
 
 from __future__ import annotations
@@ -82,7 +85,12 @@ def seed(csv_path: str, db_path: str) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Seed the lunch-bot pool from a CSV.")
-    parser.add_argument("csv_path", help="Path to the CSV file to import.")
+    parser.add_argument(
+        "csv_path",
+        nargs="?",
+        default=None,
+        help="Path to the CSV file to import (defaults to config restaurants_csv).",
+    )
     parser.add_argument(
         "--db-path",
         default=None,
@@ -90,8 +98,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    db_path = args.db_path or load_config().db_path
-    count = seed(args.csv_path, db_path)
+    config = load_config()
+    csv_path = args.csv_path or config.restaurants_csv
+    db_path = args.db_path or config.db_path
+    count = seed(csv_path, db_path)
     print(f"Imported {count} restaurants into {db_path}")
 
 

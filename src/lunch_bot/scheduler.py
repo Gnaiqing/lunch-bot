@@ -1,8 +1,17 @@
 """APScheduler jobs for the weekly lunch workflow.
 
-- **Monday**: build and post the poll (diverse, vote-weighted candidates).
-- **Thursday**: close the poll, announce the winner, and post the Uber Eats
-  order-prep summary (a human then places the order).
+Three configurable bot jobs (all times local to ``config.timezone``):
+
+- **Poll create** (default Mon 10:00): build and post the poll (diverse,
+  vote-weighted candidates), opening voting.
+- **Poll close + announce** (default Wed 10:00): close the poll, tally + record
+  votes, announce the winner, and prompt the ORGANIZER to create and post the
+  Uber Eats group-order link (a suggested search is included to save a lookup).
+- **Order reminder** (default Thu 10:00): remind the group to place their orders
+  on the group-order link before the organizer's deadline (``order_deadline``,
+  default Thu 11:00 — a HUMAN step, so there is no bot job for it).
+
+The bot NEVER creates or places the order.
 
 ``apscheduler`` and ``slack_sdk`` interactions happen through a Bolt ``app``
 client handle passed in; ``apscheduler`` is imported lazily inside
@@ -24,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 def create_weekly_poll(config: Config, conn, client) -> int | None:
-    """Select candidates and post the Monday poll to the channel.
+    """Select candidates and post the poll-create-day poll to the channel.
 
     Returns the new poll id, or ``None`` if there was nothing to offer.
     """
@@ -43,8 +52,8 @@ def create_weekly_poll(config: Config, conn, client) -> int | None:
     if not candidates:
         return None
 
-    # Poll closes just before the Thursday reading-group run.
-    closes_at = (datetime.now(timezone.utc) + timedelta(days=3)).isoformat()
+    # Poll closes on the configured poll_close day (Mon -> Wed by default).
+    closes_at = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
     poll_id = db.create_poll(
         conn,
         config.slack_channel_id,
@@ -65,16 +74,19 @@ def create_weekly_poll(config: Config, conn, client) -> int | None:
     return poll_id
 
 
-def announce_winner_and_prep_order(config: Config, conn, client, *, reading_group_time: str | None = None):
-    """Close the open poll, announce the winner, and post Uber Eats prep.
+def close_poll_and_announce(config: Config, conn, client, *, reading_group_time: str | None = None):
+    """Close the open poll, record votes, announce the winner, and prompt prep.
 
-    Also folds the poll's votes into each restaurant's ``total_votes`` so future
-    selections are vote-weighted.
+    Folds the poll's votes into each restaurant's ``total_votes`` (and
+    ``times_selected``) so future selections are vote-weighted (preference
+    memory). Then posts the winner and prompts the ORGANIZER to create + post the
+    Uber Eats group-order link (with a suggested search to save a lookup). The
+    bot never creates or places the order.
     """
     config.require("slack_channel_id")
     open_poll = db.get_open_poll(conn, config.slack_channel_id)
     if not open_poll:
-        logger.warning("No open poll to close on Thursday.")
+        logger.warning("No open poll to close + announce.")
         return
     poll_id = open_poll["id"]
 
@@ -99,27 +111,53 @@ def announce_winner_and_prep_order(config: Config, conn, client, *, reading_grou
     logger.info("Announced winner %s for poll %s", winner.name, poll_id)
 
 
-def build_scheduler(config: Config, conn, client):
-    """Create a ``BackgroundScheduler`` with the Monday/Thursday jobs registered.
+def send_order_reminder(config: Config, conn, client):
+    """Post the order-day reminder pinging the group to place their orders.
 
-    The caller is responsible for ``scheduler.start()`` and keeping the process
-    alive (see :mod:`lunch_bot.main`).
+    References the ``order_deadline`` cutoff, at which the organizer (a HUMAN)
+    closes the group-order link and places the order. There is no bot job for the
+    deadline itself.
+    """
+    config.require("slack_channel_id")
+    deadline = config.schedule["order_deadline"].time_str
+    blocks = polls.build_order_reminder_blocks(deadline)
+    client.chat_postMessage(
+        channel=config.slack_channel_id,
+        blocks=blocks,
+        text=f"Reminder: place your lunch orders before {deadline}!",
+    )
+    logger.info("Posted order reminder (deadline %s)", deadline)
+
+
+def build_scheduler(config: Config, conn, client):
+    """Create a ``BackgroundScheduler`` with the three configured jobs registered.
+
+    Builds cron triggers from ``config.schedule`` (poll_create / poll_close /
+    order_reminder) using ``config.timezone``. ``order_deadline`` is
+    informational only and is NOT scheduled. The caller is responsible for
+    ``scheduler.start()`` and keeping the process alive (see :mod:`lunch_bot.main`).
     """
     from apscheduler.schedulers.background import BackgroundScheduler  # lazy
     from apscheduler.triggers.cron import CronTrigger  # lazy
 
     scheduler = BackgroundScheduler(timezone=config.timezone)
 
-    scheduler.add_job(
-        lambda: create_weekly_poll(config, conn, client),
-        CronTrigger(day_of_week="mon", hour=config.monday_hour, minute=0),
-        id="monday_poll",
-        replace_existing=True,
+    jobs = (
+        ("poll_create", lambda: create_weekly_poll(config, conn, client)),
+        ("poll_close", lambda: close_poll_and_announce(config, conn, client)),
+        ("order_reminder", lambda: send_order_reminder(config, conn, client)),
     )
-    scheduler.add_job(
-        lambda: announce_winner_and_prep_order(config, conn, client),
-        CronTrigger(day_of_week="thu", hour=config.thursday_hour, minute=0),
-        id="thursday_announce",
-        replace_existing=True,
-    )
+    for job_id, func in jobs:
+        entry = config.schedule[job_id]
+        scheduler.add_job(
+            func,
+            CronTrigger(
+                day_of_week=entry.day,
+                hour=entry.hour,
+                minute=entry.minute,
+                timezone=config.timezone,
+            ),
+            id=job_id,
+            replace_existing=True,
+        )
     return scheduler

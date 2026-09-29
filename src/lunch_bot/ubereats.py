@@ -63,9 +63,10 @@ def build_order_summary(
         lines.append(f"Address: {restaurant.address}")
     if reading_group_time:
         lines.append(f"Needed by: {reading_group_time}")
-    lines.append(f"Order here (human places it): {link}")
+    lines.append(f"Suggested Uber Eats search (to save a lookup): {link}")
     lines.append(
-        "_Semi-automated: the bot preps the order; a human places it on Uber Eats._"
+        "*Organizer:* please create the Uber Eats *group order* and post the "
+        "shareable link in this channel. The bot never creates or places the order."
     )
     if voters:
         lines.append("Voters: " + ", ".join(voters))
@@ -91,7 +92,7 @@ def build_order_summary(
             "elements": [
                 {
                     "type": "mrkdwn",
-                    "text": "The bot never places the order — please confirm items and checkout yourself.",
+                    "text": "The bot never creates or places the order — the organizer sets up the group order and checks out.",
                 }
             ],
         },

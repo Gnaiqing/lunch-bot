@@ -29,6 +29,35 @@ DEFAULT_MAX_PRICE_LEVEL = 2  # Google price_level 0..4; <=2 ~ "economic" (<= $30
 DEFAULT_EXPLORATION_C = 1.0
 DEFAULT_DB_PATH = "lunch_bot.db"
 DEFAULT_LLM_MODEL = "claude-haiku-4-5"  # small/fast model for tagging + parsing
+DEFAULT_RESTAURANTS_CSV = "data/restaurants_seed.csv"  # candidate source for seeding
+
+# Channels. The PRODUCTION channel is #dl-time-series-tabular; #thoughts-on-lunch
+# (C0C4DT9J75Z) is the TEST channel — set SLACK_CHANNEL_ID to it while testing.
+DEFAULT_SLACK_CHANNEL_ID = "C03J1AVLGFM"  # #dl-time-series-tabular (production)
+DEFAULT_SLACK_CHANNEL_NAME = "#dl-time-series-tabular"
+
+# Scheduling. Times are local to ``timezone``. ``order_deadline`` is
+# informational (used in the reminder text): the organizer places the order then,
+# so it is NOT a scheduled bot job.
+DEFAULT_TIMEZONE = "America/Toronto"
+DEFAULT_SCHEDULE: dict[str, dict[str, str]] = {
+    "poll_create": {"day": "mon", "time": "10:00"},
+    "poll_close": {"day": "wed", "time": "10:00"},  # close poll + announce winner
+    "order_reminder": {"day": "thu", "time": "10:00"},
+    "order_deadline": {"day": "thu", "time": "11:00"},  # informational only
+}
+
+# Canonical APScheduler day_of_week tokens plus full-name aliases.
+_WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+_DAY_ALIASES = {
+    "monday": "mon",
+    "tuesday": "tue",
+    "wednesday": "wed",
+    "thursday": "thu",
+    "friday": "fri",
+    "saturday": "sat",
+    "sunday": "sun",
+}
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -51,6 +80,93 @@ def _as_float(value: Any, default: float) -> float:
     return float(value)
 
 
+def _parse_day(value: Any, *, field_name: str) -> str:
+    """Normalise a weekday to an APScheduler token (``mon``..``sun``).
+
+    Accepts short (``mon``) or full (``monday``) names, case-insensitively.
+    Raises ``ValueError`` with a clear message on anything else.
+    """
+    key = str(value).strip().lower()
+    if key in _WEEKDAYS:
+        return key
+    if key in _DAY_ALIASES:
+        return _DAY_ALIASES[key]
+    raise ValueError(
+        f"Invalid weekday for {field_name}: {value!r}. "
+        f"Use one of {', '.join(_WEEKDAYS)} (or full names like 'monday')."
+    )
+
+
+def _parse_time(value: Any, *, field_name: str) -> tuple[int, int]:
+    """Parse an ``"HH:MM"`` string into ``(hour, minute)``.
+
+    Raises ``ValueError`` with a clear message on a malformed value or an
+    out-of-range hour/minute.
+    """
+    text = str(value).strip()
+    parts = text.split(":")
+    if len(parts) != 2:
+        raise ValueError(
+            f"Invalid time for {field_name}: {value!r}. Expected 'HH:MM' (24-hour)."
+        )
+    try:
+        hour, minute = int(parts[0]), int(parts[1])
+    except ValueError:
+        raise ValueError(
+            f"Invalid time for {field_name}: {value!r}. Expected 'HH:MM' (24-hour)."
+        ) from None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError(
+            f"Invalid time for {field_name}: {value!r}. "
+            "Hour must be 0-23 and minute 0-59."
+        )
+    return hour, minute
+
+
+@dataclass
+class ScheduleEntry:
+    """A single scheduled phase: a weekday and a local time.
+
+    ``day`` is an APScheduler ``day_of_week`` token (``mon``..``sun``).
+    """
+
+    day: str
+    hour: int
+    minute: int
+
+    @property
+    def time_str(self) -> str:
+        """The ``"HH:MM"`` rendering, e.g. for reminder/log text."""
+        return f"{self.hour:02d}:{self.minute:02d}"
+
+
+def _build_schedule(yaml_cfg: dict) -> dict[str, ScheduleEntry]:
+    """Build the phase -> :class:`ScheduleEntry` map from yaml over defaults.
+
+    Each phase (and each ``day``/``time`` within it) falls back to
+    :data:`DEFAULT_SCHEDULE`. Raises ``ValueError`` on malformed input.
+    """
+    raw = yaml_cfg.get("schedule") or {}
+    if not isinstance(raw, dict):
+        raise ValueError("config 'schedule' must be a mapping of phase -> {day, time}.")
+
+    schedule: dict[str, ScheduleEntry] = {}
+    for phase, default in DEFAULT_SCHEDULE.items():
+        entry = raw.get(phase)
+        if entry is None:
+            entry = {}
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"schedule.{phase} must be a mapping with 'day' and 'time'."
+            )
+        day = _parse_day(entry.get("day", default["day"]), field_name=f"schedule.{phase}.day")
+        hour, minute = _parse_time(
+            entry.get("time", default["time"]), field_name=f"schedule.{phase}.time"
+        )
+        schedule[phase] = ScheduleEntry(day=day, hour=hour, minute=minute)
+    return schedule
+
+
 @dataclass
 class Config:
     """Resolved configuration for the bot.
@@ -67,7 +183,8 @@ class Config:
     anthropic_api_key: Optional[str] = None
 
     # --- Non-secret knobs (env or yaml) ---
-    slack_channel_id: Optional[str] = None
+    slack_channel_id: Optional[str] = DEFAULT_SLACK_CHANNEL_ID
+    slack_channel_name: str = DEFAULT_SLACK_CHANNEL_NAME  # human-readable, for messages
     office_address: str = DEFAULT_OFFICE_ADDRESS
     office_lat: float = DEFAULT_OFFICE_LAT
     office_lng: float = DEFAULT_OFFICE_LNG
@@ -77,11 +194,13 @@ class Config:
     exploration_c: float = DEFAULT_EXPLORATION_C
     db_path: str = DEFAULT_DB_PATH
     llm_model: str = DEFAULT_LLM_MODEL
+    restaurants_csv: str = DEFAULT_RESTAURANTS_CSV  # candidate source for seeding
 
-    # Scheduling (cron-ish). Times are local to ``timezone``.
-    timezone: str = "America/Toronto"
-    monday_hour: int = 10  # Monday poll creation hour (24h)
-    thursday_hour: int = 11  # Thursday announce + order-prep hour (24h)
+    # Scheduling. Times are local to ``timezone``. ``schedule`` maps each phase
+    # (poll_create/poll_close/order_reminder/order_deadline) to a ScheduleEntry;
+    # ``order_deadline`` is informational only (no bot job).
+    timezone: str = DEFAULT_TIMEZONE
+    schedule: dict = field(default_factory=lambda: _build_schedule({}))
 
     # Raw yaml contents for anything not explicitly modelled here.
     extra: dict = field(default_factory=dict)
@@ -164,7 +283,8 @@ def load_config(
         google_maps_api_key=env.get("GOOGLE_MAPS_API_KEY"),
         anthropic_api_key=env.get("ANTHROPIC_API_KEY"),
         # Non-secret knobs: env > yaml > default.
-        slack_channel_id=pick("SLACK_CHANNEL_ID", "slack_channel_id", None),
+        slack_channel_id=pick("SLACK_CHANNEL_ID", "slack_channel_id", DEFAULT_SLACK_CHANNEL_ID),
+        slack_channel_name=pick("SLACK_CHANNEL_NAME", "slack_channel_name", DEFAULT_SLACK_CHANNEL_NAME),
         office_address=pick("OFFICE_ADDRESS", "office_address", DEFAULT_OFFICE_ADDRESS),
         office_lat=_as_float(pick("OFFICE_LAT", "office_lat", DEFAULT_OFFICE_LAT), DEFAULT_OFFICE_LAT),
         office_lng=_as_float(pick("OFFICE_LNG", "office_lng", DEFAULT_OFFICE_LNG), DEFAULT_OFFICE_LNG),
@@ -174,8 +294,8 @@ def load_config(
         exploration_c=_as_float(pick("EXPLORATION_C", "exploration_c", DEFAULT_EXPLORATION_C), DEFAULT_EXPLORATION_C),
         db_path=pick("DB_PATH", "db_path", DEFAULT_DB_PATH),
         llm_model=pick("LLM_MODEL", "llm_model", DEFAULT_LLM_MODEL),
-        timezone=pick("TIMEZONE", "timezone", "America/Toronto"),
-        monday_hour=_as_int(pick("MONDAY_HOUR", "monday_hour", 10), 10),
-        thursday_hour=_as_int(pick("THURSDAY_HOUR", "thursday_hour", 11), 11),
+        restaurants_csv=pick("RESTAURANTS_CSV", "restaurants_csv", DEFAULT_RESTAURANTS_CSV),
+        timezone=pick("TIMEZONE", "timezone", DEFAULT_TIMEZONE),
+        schedule=_build_schedule(yaml_cfg),
         extra=yaml_cfg,
     )

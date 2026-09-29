@@ -102,6 +102,35 @@ def build_poll_blocks(
     return blocks
 
 
+def build_order_reminder_blocks(
+    order_deadline: str,
+    *,
+    group_mention: str = "<!here>",
+    header: str = "🍔 Time to place your lunch orders!",
+) -> list[dict]:
+    """Build the Block Kit blocks for the order-day reminder message.
+
+    Args:
+        order_deadline: Human ``"HH:MM"`` string for when the organizer closes
+            the group order and places it (a HUMAN step — no bot job runs then).
+        group_mention: Slack mention to ping the group (default ``<!here>``).
+        header: The header text.
+
+    Returns:
+        A list of Block Kit block dicts suitable for ``chat_postMessage``.
+    """
+    text = (
+        f"{group_mention} please add your items to the Uber Eats *group order* "
+        "link the organizer posted in this channel.\n"
+        f"The organizer will close the link and place the order at *{order_deadline}*, "
+        "so get your picks in before then!"
+    )
+    return [
+        {"type": "header", "text": {"type": "plain_text", "text": header}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+    ]
+
+
 def handle_vote(conn, action_id: str, slack_user_id: str) -> Optional[tuple[int, int]]:
     """Record a vote from a button click.
 

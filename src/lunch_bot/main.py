@@ -68,8 +68,16 @@ def main() -> None:
 
     scheduler = build_scheduler(config, conn, app.client)
     scheduler.start()
-    logger.info("Scheduler started (Monday poll @ %02d:00, Thursday announce @ %02d:00, tz=%s)",
-                config.monday_hour, config.thursday_hour, config.timezone)
+    sched = config.schedule
+    logger.info(
+        "Scheduler started (poll_create %s %s, poll_close %s %s, order_reminder %s %s; "
+        "order_deadline %s %s [human, no job]; tz=%s)",
+        sched["poll_create"].day, sched["poll_create"].time_str,
+        sched["poll_close"].day, sched["poll_close"].time_str,
+        sched["order_reminder"].day, sched["order_reminder"].time_str,
+        sched["order_deadline"].day, sched["order_deadline"].time_str,
+        config.timezone,
+    )
 
     handler = SocketModeHandler(app, config.slack_app_token)
     logger.info("Starting Slack Socket Mode handler…")
