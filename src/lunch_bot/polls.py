@@ -145,13 +145,13 @@ def handle_vote(conn, action_id: str, slack_user_id: str) -> Optional[tuple[int,
         return None
     poll_id, restaurant_id = parsed
 
-    poll = db.get_poll(conn, poll_id)
-    if poll is None or poll["status"] != "open":
+    # Check-and-insert must be atomic: the status/option validation and the insert
+    # run under a single DB write lock (shared with the poll-close path) so a close
+    # can't slip between the check and the insert and let a late vote land after the
+    # tally. ``record_vote_if_open`` returns ``False`` for a closed/missing poll or
+    # an invalid/forged option, which we surface as an ignored vote.
+    if not db.record_vote_if_open(conn, poll_id, restaurant_id, slack_user_id):
         return None
-    if restaurant_id not in db.get_poll_option_ids(conn, poll_id):
-        return None
-
-    db.record_vote(conn, poll_id, restaurant_id, slack_user_id)
     return poll_id, restaurant_id
 
 

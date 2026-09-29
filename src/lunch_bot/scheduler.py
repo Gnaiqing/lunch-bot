@@ -106,9 +106,15 @@ def close_poll_and_announce(config: Config, conn, client, *, reading_group_time:
         return
     poll_id = open_poll["id"]
 
-    winner_id = polls.determine_winner(conn, poll_id)
-    db.apply_vote_totals_to_pool(conn, poll_id)
-    db.close_poll(conn, poll_id, winner_id)
+    # Close + tally + winner selection happen in ONE atomic DB operation that
+    # serialises with vote recording on the same lock, so no vote can interleave
+    # between tallying and closing, and the (additive) totals fold is applied
+    # exactly once. ``applied`` is False if the poll was already closed (e.g. a
+    # concurrent/duplicate run won the race) — then there's nothing to announce.
+    applied, winner_id = db.close_poll_and_tally(conn, poll_id)
+    if not applied:
+        logger.warning("Poll %s was already closed; skipping tally + announce.", poll_id)
+        return
 
     if winner_id is None:
         client.chat_postMessage(

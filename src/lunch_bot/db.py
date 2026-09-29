@@ -313,6 +313,45 @@ def record_vote(
         conn.commit()
 
 
+def record_vote_if_open(
+    conn: sqlite3.Connection, poll_id: int, restaurant_id: int, slack_user_id: str
+) -> bool:
+    """Record (or change) a vote atomically, only while the poll is still open.
+
+    The status + option checks and the insert all happen inside a SINGLE
+    ``_write_lock`` transaction, so a concurrent close (which takes the same lock)
+    cannot land between the check and the insert — a late vote can never slip in
+    after the tally. Returns ``True`` if the vote was recorded, or ``False`` when
+    the poll is missing/closed or ``restaurant_id`` isn't one of its options.
+
+    The ``UNIQUE (poll_id, slack_user_id)`` constraint means a repeat vote from
+    the same user updates their existing choice rather than adding a second one.
+    """
+    with _write_lock:
+        poll = conn.execute(
+            "SELECT status FROM polls WHERE id = ?", (poll_id,)
+        ).fetchone()
+        if poll is None or poll["status"] != "open":
+            return False
+        option = conn.execute(
+            "SELECT 1 FROM poll_options WHERE poll_id = ? AND restaurant_id = ?",
+            (poll_id, restaurant_id),
+        ).fetchone()
+        if option is None:
+            return False
+        conn.execute(
+            """
+            INSERT INTO votes (poll_id, restaurant_id, slack_user_id, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (poll_id, slack_user_id)
+            DO UPDATE SET restaurant_id = excluded.restaurant_id, created_at = excluded.created_at
+            """,
+            (poll_id, restaurant_id, slack_user_id, _now_iso()),
+        )
+        conn.commit()
+        return True
+
+
 def tally_votes(conn: sqlite3.Connection, poll_id: int) -> dict[int, int]:
     """Return ``{restaurant_id: vote_count}`` for a poll."""
     rows = conn.execute(
@@ -337,3 +376,59 @@ def apply_vote_totals_to_pool(conn: sqlite3.Connection, poll_id: int) -> None:
                 (count, rid),
             )
         conn.commit()
+
+
+def close_poll_and_tally(
+    conn: sqlite3.Connection, poll_id: int
+) -> tuple[bool, Optional[int]]:
+    """Atomically close an open poll: tally, fold totals into the pool, pick the
+    winner, and mark the poll closed — all in ONE ``_write_lock`` transaction.
+
+    This is the single close/tally boundary that serialises against
+    :func:`record_vote_if_open` (same lock), so no vote can interleave between
+    winner determination, applying totals, and the close: an accepted vote is
+    always either fully counted before the close or rejected as late.
+
+    The whole operation is gated on the poll still being ``open``. If it is
+    already closed (or missing) nothing is applied and ``(False, None)`` is
+    returned — making the close idempotent: a re-run after a crash won't
+    double-apply the (additive) vote totals. On a successful close it returns
+    ``(True, winner_id)`` where ``winner_id`` is the highest-tally restaurant
+    (ties broken by lowest id), or ``None`` when no votes were cast.
+    """
+    with _write_lock:
+        poll = conn.execute(
+            "SELECT status FROM polls WHERE id = ?", (poll_id,)
+        ).fetchone()
+        if poll is None or poll["status"] != "open":
+            return (False, None)
+
+        rows = conn.execute(
+            "SELECT restaurant_id, COUNT(*) AS c FROM votes WHERE poll_id = ? GROUP BY restaurant_id",
+            (poll_id,),
+        ).fetchall()
+        tally = {r["restaurant_id"]: r["c"] for r in rows}
+
+        winner_id: Optional[int] = None
+        if tally:
+            # Highest vote count wins; ties broken by lowest restaurant id.
+            winner_id = sorted(tally.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+
+        # Apply totals as part of the open->closed transition (never on its own),
+        # so the additive fold happens exactly once.
+        for rid, count in tally.items():
+            conn.execute(
+                "UPDATE restaurants SET total_votes = total_votes + ? WHERE id = ?",
+                (count, rid),
+            )
+
+        # Belt-and-suspenders: gate the transition on ``status = 'open'`` at the
+        # DB level too. Under _write_lock the earlier check already guarantees it,
+        # but this keeps the write self-consistent.
+        conn.execute(
+            "UPDATE polls SET status = 'closed', winner_restaurant_id = ? "
+            "WHERE id = ? AND status = 'open'",
+            (winner_id, poll_id),
+        )
+        conn.commit()
+        return (True, winner_id)

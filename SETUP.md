@@ -32,11 +32,12 @@ configurable, so other reading groups can run their own instance (see
   and Geocoding APIs).
 - An **Anthropic account** with **credit** on it.
 
-## 3. Slack credentials (Socket Mode — 3 values)
+## 3. Slack credentials (Socket Mode)
 
-Lunch Bot uses Socket Mode, so you need three Slack secrets
-(`SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`) plus the target
-channel id (`SLACK_CHANNEL_ID`).
+Lunch Bot uses Socket Mode, so you need two Slack secrets
+(`SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`) plus the target channel id
+(`SLACK_CHANNEL_ID`). `SLACK_SIGNING_SECRET` is **optional** — it's only used by
+an HTTP request receiver, which Socket Mode does not run, so you can skip it.
 
 1. Go to <https://api.slack.com/apps> → **Create New App** → **From scratch**.
    Name it **"Lunch Bot"** and pick the **layer6** workspace.
@@ -55,8 +56,9 @@ channel id (`SLACK_CHANNEL_ID`).
    buttons. (No request URL needed with Socket Mode.)
 6. **Install App to Workspace** and approve. Copy the **Bot User OAuth Token**
    (starts with `xoxb-`) — this is your **`SLACK_BOT_TOKEN`**.
-7. **Basic Information → Signing Secret** → copy it — this is your
-   **`SLACK_SIGNING_SECRET`**.
+7. *(Optional)* **Basic Information → Signing Secret** → copy it as
+   **`SLACK_SIGNING_SECRET`**. Only needed if you later run an HTTP request
+   receiver; Socket Mode does not use it, so you can skip this step.
 8. In Slack, invite the bot to the channel: `/invite @Lunch Bot`. Open the
    channel's **About** tab and copy the **channel ID** (starts with `C…`) — set
    this as **`SLACK_CHANNEL_ID`** (the id, not the name). Production is
@@ -126,7 +128,7 @@ Secrets come from `.env` (or the shell). Non-secret knobs can live in `.env`
 |------------------------|:-------:|-------------|
 | `SLACK_BOT_TOKEN`      | yes     | Bot User OAuth Token (`xoxb-…`). **Required to start.** |
 | `SLACK_APP_TOKEN`      | yes     | App-level token for Socket Mode (`xapp-…`, scope `connections:write`). **Required to start.** |
-| `SLACK_SIGNING_SECRET` | yes     | Slack app signing secret (Basic Information). **Required to start.** |
+| `SLACK_SIGNING_SECRET` | yes     | Slack app signing secret (Basic Information). **Optional** — only for an HTTP request receiver; not used by Socket Mode. |
 | `GOOGLE_MAPS_API_KEY`  | yes     | Google API key with Places API + Geocoding API enabled. Needed for restaurant discovery. |
 | `ANTHROPIC_API_KEY`    | yes     | Anthropic API key (`sk-ant-…`). Required only when `LLM_PROVIDER=anthropic`; enables cuisine tagging + suggestion parsing. |
 | `OPENAI_API_KEY`       | yes     | OpenAI API key (`sk-…`). Required only when `LLM_PROVIDER=openai`; enables cuisine tagging + suggestion parsing. |

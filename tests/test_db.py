@@ -108,6 +108,112 @@ def test_handle_vote_ignores_non_vote_action(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# G2 — atomic check-and-insert vote guard (record_vote_if_open).
+# ---------------------------------------------------------------------------
+def test_record_vote_if_open_records_open_vote(tmp_path):
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    poll_id, r1, _ = _two_option_poll(conn)
+    assert db.record_vote_if_open(conn, poll_id, r1, "U1") is True
+    assert db.tally_votes(conn, poll_id) == {r1: 1}
+
+
+def test_record_vote_if_open_rejects_closed_poll(tmp_path):
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    poll_id, r1, r2 = _two_option_poll(conn)
+    db.record_vote_if_open(conn, poll_id, r1, "U1")
+    db.close_poll(conn, poll_id, r1)
+
+    # The conditional write must not insert once the poll is closed.
+    assert db.record_vote_if_open(conn, poll_id, r2, "U2") is False
+    assert db.tally_votes(conn, poll_id) == {r1: 1}
+
+
+def test_record_vote_if_open_rejects_invalid_option(tmp_path):
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    poll_id, _, _ = _two_option_poll(conn)
+    outsider = db.upsert_restaurant(conn, Restaurant(name="C", cuisine="z"))
+    assert db.record_vote_if_open(conn, poll_id, outsider, "U1") is False
+    assert db.tally_votes(conn, poll_id) == {}
+
+
+# ---------------------------------------------------------------------------
+# G3/G4 — atomic close + tally + winner (close_poll_and_tally), idempotent.
+# ---------------------------------------------------------------------------
+def _total_votes(conn, rid):
+    return conn.execute(
+        "SELECT total_votes FROM restaurants WHERE id = ?", (rid,)
+    ).fetchone()["total_votes"]
+
+
+def test_close_poll_and_tally_counts_votes_and_picks_winner(tmp_path):
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    poll_id, r1, r2 = _two_option_poll(conn)
+    # Votes recorded BEFORE close must be counted.
+    db.record_vote_if_open(conn, poll_id, r1, "U1")
+    db.record_vote_if_open(conn, poll_id, r1, "U2")
+    db.record_vote_if_open(conn, poll_id, r2, "U3")
+
+    applied, winner_id = db.close_poll_and_tally(conn, poll_id)
+    assert applied is True
+    assert winner_id == r1  # 2 votes beats 1
+    assert db.get_poll(conn, poll_id)["status"] == "closed"
+    assert db.get_poll(conn, poll_id)["winner_restaurant_id"] == r1
+    # Totals folded into the pool exactly once.
+    assert _total_votes(conn, r1) == 2
+    assert _total_votes(conn, r2) == 1
+
+
+def test_close_poll_and_tally_is_idempotent(tmp_path):
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    poll_id, r1, r2 = _two_option_poll(conn)
+    db.record_vote_if_open(conn, poll_id, r1, "U1")
+    db.record_vote_if_open(conn, poll_id, r1, "U2")
+    db.record_vote_if_open(conn, poll_id, r2, "U3")
+
+    first = db.close_poll_and_tally(conn, poll_id)
+    assert first == (True, r1)
+
+    # A re-run (e.g. after a crash between commit and close) must be a no-op and
+    # must NOT double-apply the additive totals.
+    second = db.close_poll_and_tally(conn, poll_id)
+    assert second == (False, None)
+    assert _total_votes(conn, r1) == 2
+    assert _total_votes(conn, r2) == 1
+
+
+def test_close_poll_and_tally_no_votes(tmp_path):
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    poll_id, r1, r2 = _two_option_poll(conn)
+    applied, winner_id = db.close_poll_and_tally(conn, poll_id)
+    assert applied is True
+    assert winner_id is None
+    assert db.get_poll(conn, poll_id)["status"] == "closed"
+    assert _total_votes(conn, r1) == 0
+    assert _total_votes(conn, r2) == 0
+
+
+def test_close_poll_and_tally_tie_breaks_by_lowest_id(tmp_path):
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    poll_id, r1, r2 = _two_option_poll(conn)
+    db.record_vote_if_open(conn, poll_id, r1, "U1")
+    db.record_vote_if_open(conn, poll_id, r2, "U2")
+    applied, winner_id = db.close_poll_and_tally(conn, poll_id)
+    assert applied is True
+    assert winner_id == min(r1, r2)
+
+
+def test_vote_after_close_is_rejected(tmp_path):
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    poll_id, r1, r2 = _two_option_poll(conn)
+    db.record_vote_if_open(conn, poll_id, r1, "U1")
+    db.close_poll_and_tally(conn, poll_id)
+
+    # A late vote after the atomic close cannot land in the tally.
+    assert db.record_vote_if_open(conn, poll_id, r2, "U2") is False
+    assert db.tally_votes(conn, poll_id) == {r1: 1}
+
+
+# ---------------------------------------------------------------------------
 # F1 — cross-thread write smoke test.
 # ---------------------------------------------------------------------------
 def test_write_from_separate_thread(tmp_path):

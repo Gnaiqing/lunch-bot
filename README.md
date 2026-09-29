@@ -136,7 +136,8 @@ hardcoded. To stand up a new group:
    - `channels:history` — read channel history as appropriate
 4. **Event Subscriptions:** subscribe to the `app_mention` bot event.
 5. Install the app to your workspace; copy the **Bot User OAuth Token**
-   (`xoxb-…`) → `SLACK_BOT_TOKEN`, and the **Signing Secret** → `SLACK_SIGNING_SECRET`.
+   (`xoxb-…`) → `SLACK_BOT_TOKEN`. (The **Signing Secret** → `SLACK_SIGNING_SECRET`
+   is *optional* — only needed for an HTTP request receiver, not Socket Mode.)
 6. Invite the bot to your channel and copy the channel **id** (not name) →
    `SLACK_CHANNEL_ID`. Production is **#dl-time-series-tabular** (`C03J1AVLGFM`,
    the default); use the test channel **#thoughts-on-lunch** (`C0C4DT9J75Z`) while

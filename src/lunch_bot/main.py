@@ -22,10 +22,15 @@ logger = logging.getLogger(__name__)
 
 # Config attributes that must be set before the bot can start, mapped to the
 # environment variable a user actually sets them with.
+#
+# The bot runs in Socket Mode: the app-level token (``SLACK_APP_TOKEN``)
+# authenticates the Socket Mode connection and the bot token
+# (``SLACK_BOT_TOKEN``) authenticates Web API calls. ``SLACK_SIGNING_SECRET`` is
+# only needed for an HTTP request receiver, which Socket Mode does not use, so it
+# is intentionally NOT required here (the field stays available but optional).
 REQUIRED_SETTINGS = {
     "slack_bot_token": "SLACK_BOT_TOKEN",
     "slack_app_token": "SLACK_APP_TOKEN",
-    "slack_signing_secret": "SLACK_SIGNING_SECRET",
     "slack_channel_id": "SLACK_CHANNEL_ID",
 }
 

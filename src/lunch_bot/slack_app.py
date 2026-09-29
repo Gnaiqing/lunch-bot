@@ -43,7 +43,11 @@ def build_app(config: Config, conn, llm=None):
     """
     from slack_bolt import App  # lazy import — optional dependency
 
-    config.require("slack_bot_token", "slack_signing_secret")
+    # Socket Mode authenticates via the app-level + bot tokens; the signing secret
+    # is only used by an HTTP request receiver, which we don't run. Require just
+    # the bot token here and pass the signing secret through only when it happens
+    # to be set (it may be ``None``).
+    config.require("slack_bot_token")
 
     app = App(
         token=config.slack_bot_token,
