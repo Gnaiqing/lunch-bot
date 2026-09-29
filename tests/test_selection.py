@@ -123,3 +123,26 @@ def test_inactive_excluded():
 
 def test_empty_pool_returns_empty():
     assert select_candidates([], n=5, rng=random.Random(0)) == []
+
+
+def test_mixed_case_cuisine_treated_as_one_bucket():
+    """Mixed-case/whitespace variants of one cuisine collapse into a single
+    diversity bucket, so the guarantee still holds.
+
+    The pool has three "Japanese" spellings (``Japanese``/``japanese``/``
+    JAPANESE ``) plus one lone Thai. After normalization there are exactly two
+    cuisines, so a pick of 2 always spans both — the Thai option is always chosen.
+    Without normalization the Japanese variants would be three separate buckets
+    and the Thai option could be skipped.
+    """
+    pool = [
+        Restaurant(name="Alpha", cuisine="Japanese", times_selected=1, total_votes=1),
+        Restaurant(name="Beta", cuisine="japanese", times_selected=1, total_votes=1),
+        Restaurant(name="Gamma", cuisine=" JAPANESE ", times_selected=1, total_votes=1),
+        Restaurant(name="Solo Thai", cuisine="thai", times_selected=1, total_votes=1),
+    ]
+    for seed in range(200):
+        picks = select_candidates(pool, n=2, rng=random.Random(seed))
+        cuisines = {r.cuisine.strip().casefold() for r in picks}
+        assert cuisines == {"japanese", "thai"}, f"seed={seed} picks={[r.name for r in picks]}"
+        assert any(r.name == "Solo Thai" for r in picks)

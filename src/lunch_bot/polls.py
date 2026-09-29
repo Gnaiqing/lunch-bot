@@ -134,13 +134,23 @@ def build_order_reminder_blocks(
 def handle_vote(conn, action_id: str, slack_user_id: str) -> Optional[tuple[int, int]]:
     """Record a vote from a button click.
 
-    Returns ``(poll_id, restaurant_id)`` on success, or ``None`` if the action
-    was not a recognisable vote action.
+    Returns ``(poll_id, restaurant_id)`` on success, or ``None`` if the vote
+    should be ignored: the action isn't a recognisable vote action, the poll is
+    no longer open (a late vote on a closed poll), or the restaurant isn't one of
+    that poll's options (an invalid/forged option). Guarding here keeps late or
+    invalid clicks from mutating the tally.
     """
     parsed = parse_vote_action_id(action_id)
     if not parsed:
         return None
     poll_id, restaurant_id = parsed
+
+    poll = db.get_poll(conn, poll_id)
+    if poll is None or poll["status"] != "open":
+        return None
+    if restaurant_id not in db.get_poll_option_ids(conn, poll_id):
+        return None
+
     db.record_vote(conn, poll_id, restaurant_id, slack_user_id)
     return poll_id, restaurant_id
 

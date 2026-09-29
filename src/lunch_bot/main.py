@@ -100,7 +100,7 @@ def main() -> None:
 
     app = build_app(config, conn, llm=llm)
 
-    scheduler = build_scheduler(config, conn, app.client)
+    scheduler = build_scheduler(config, conn, app.client, llm=llm)
     scheduler.start()
     sched = config.schedule
     logger.info(

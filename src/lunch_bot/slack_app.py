@@ -65,9 +65,15 @@ def build_app(config: Config, conn, llm=None):
         name = None
         location_hint = None
         if llm is not None:
-            parsed = llm.parse_suggestion(text)
-            name = parsed.get("name")
-            location_hint = parsed.get("location_hint")
+            try:
+                parsed = llm.parse_suggestion(text)
+                name = parsed.get("name")
+                location_hint = parsed.get("location_hint")
+            except Exception:  # pragma: no cover - LLM best-effort
+                # A transient provider failure must not abort the handler; fall
+                # back to the non-LLM path (treat the whole message as the name).
+                name = None
+                location_hint = None
         if not name:
             # Fall back to treating the whole message as the name.
             name = text

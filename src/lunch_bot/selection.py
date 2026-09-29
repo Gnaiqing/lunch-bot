@@ -149,10 +149,14 @@ def select_candidates(
             r, exploration_c=exploration_c, optimistic_prior=optimistic_prior
         )
 
-    # Bucket by cuisine.
+    # Bucket by cuisine. Normalize the key (casefold + strip) so mixed-case
+    # duplicates of the same cuisine — e.g. seed rows tagged "Japanese" and the
+    # LLM's lowercase "japanese" — collapse into one bucket and the diversity
+    # guarantee holds. The restaurants' own ``cuisine`` display values are left
+    # untouched.
     by_cuisine: dict[str, list[Restaurant]] = defaultdict(list)
     for r in active:
-        key = r.cuisine if r.cuisine else "__unknown__"
+        key = r.cuisine.strip().casefold() if r.cuisine and r.cuisine.strip() else "__unknown__"
         by_cuisine[key].append(r)
 
     chosen: list[Restaurant] = []
