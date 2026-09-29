@@ -213,10 +213,16 @@ pytest
 ```
 
 The test suite (`tests/test_selection.py`, `tests/test_config.py`,
-`tests/test_schedule.py`) covers the pure logic and config/schedule parsing only
-and needs **no** network, Slack, Google, or Anthropic
-credentials. The pure-logic modules keep heavy imports lazy, so these tests run
-even if the Slack/Google/Anthropic packages aren't installed.
+`tests/test_schedule.py`, `tests/test_db.py`, `tests/test_main.py`,
+`tests/test_scheduler.py`, and `tests/test_llm.py`) covers the pure logic,
+config/schedule parsing, the SQLite layer, the startup gate, the scheduler jobs,
+and LLM provider selection. It needs **no** network access, Slack, Google, or
+Anthropic **credentials** (no live API calls are made). The pure-logic modules
+keep heavy imports lazy, so most tests run even without the Slack/Google packages
+installed; the exception is `tests/test_llm.py`, which constructs an Anthropic
+client and so needs the `anthropic` package (a project dependency in
+`requirements.txt`) installed — the OpenAI-backed test is skipped when `openai`
+is absent.
 
 ## Deploy on SkyPilot
 

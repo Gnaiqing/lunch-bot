@@ -228,30 +228,69 @@ def create_poll(
     option_restaurant_ids: Iterable[int],
     *,
     closes_at: Optional[str] = None,
+    increment_selection: bool = True,
 ) -> int:
     """Create a poll and its options; return the poll id.
 
-    Also increments ``times_selected`` and stamps ``last_selected_at`` on each
-    offered restaurant so the selection algorithm's exploration term decays.
+    When ``increment_selection`` is true (the default) this also increments
+    ``times_selected`` and stamps ``last_selected_at`` on each offered restaurant
+    so the selection algorithm's exploration term decays. Callers that must post
+    to Slack before "consuming" a selection can pass ``increment_selection=False``
+    and call :func:`increment_selection_counts` only after a successful post (see
+    :func:`lunch_bot.scheduler.create_weekly_poll`).
     """
     now = _now_iso()
+    option_ids = list(option_restaurant_ids)
     with _write_lock:
         cur = conn.execute(
             "INSERT INTO polls (slack_channel, created_at, closes_at, status) VALUES (?, ?, ?, 'open')",
             (slack_channel, now, closes_at),
         )
         poll_id = int(cur.lastrowid)
-        for rid in option_restaurant_ids:
+        for rid in option_ids:
             conn.execute(
                 "INSERT INTO poll_options (poll_id, restaurant_id) VALUES (?, ?)",
                 (poll_id, rid),
             )
+            if increment_selection:
+                conn.execute(
+                    "UPDATE restaurants SET times_selected = times_selected + 1, last_selected_at = ? WHERE id = ?",
+                    (now, rid),
+                )
+        conn.commit()
+    return poll_id
+
+
+def increment_selection_counts(
+    conn: sqlite3.Connection, restaurant_ids: Iterable[int]
+) -> None:
+    """Increment ``times_selected`` and stamp ``last_selected_at`` for each id.
+
+    Split out from :func:`create_poll` so a selection is only "consumed" once the
+    poll has actually been posted to Slack (avoids charging exploration cost for a
+    poll that never went live).
+    """
+    now = _now_iso()
+    with _write_lock:
+        for rid in restaurant_ids:
             conn.execute(
                 "UPDATE restaurants SET times_selected = times_selected + 1, last_selected_at = ? WHERE id = ?",
                 (now, rid),
             )
         conn.commit()
-    return poll_id
+
+
+def delete_poll(conn: sqlite3.Connection, poll_id: int) -> None:
+    """Delete a poll and its options (used to roll back a poll that failed to post).
+
+    Safe to call on a freshly-created poll that has no votes yet; also clears any
+    votes defensively so no orphan rows are left behind.
+    """
+    with _write_lock:
+        conn.execute("DELETE FROM votes WHERE poll_id = ?", (poll_id,))
+        conn.execute("DELETE FROM poll_options WHERE poll_id = ?", (poll_id,))
+        conn.execute("DELETE FROM polls WHERE id = ?", (poll_id,))
+        conn.commit()
 
 
 def set_poll_ts(conn: sqlite3.Connection, poll_id: int, slack_ts: str) -> None:

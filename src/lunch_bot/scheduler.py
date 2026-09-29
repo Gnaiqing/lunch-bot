@@ -68,24 +68,54 @@ def create_weekly_poll(config: Config, conn, client, *, llm=None) -> int | None:
     if not candidates:
         return None
 
+    # Reconcile any pre-existing open poll before opening a new one, so there is
+    # never more than one open poll (a missed/failed close job would otherwise
+    # leave a stale poll that get_open_poll() never revisits). Close + tally it
+    # in place WITHOUT announcing a winner — we don't want a surprise message —
+    # then log that it was reconciled.
+    stale = db.get_open_poll(conn, config.slack_channel_id)
+    if stale is not None:
+        db.close_poll_and_tally(conn, stale["id"])
+        logger.warning(
+            "Reconciled stale open poll %s (closed without announcement) before creating a new poll.",
+            stale["id"],
+        )
+
+    option_ids = [c.id for c in candidates if c.id is not None]
+
     # Poll closes on the configured poll_close day (Mon -> Wed by default).
     closes_at = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+    # Create the poll row + options (needed to build the option action_ids) but do
+    # NOT consume the selection yet: times_selected is incremented only once the
+    # poll has actually been posted, so a failed Slack post leaves no trace.
     poll_id = db.create_poll(
         conn,
         config.slack_channel_id,
-        [c.id for c in candidates if c.id is not None],
+        option_ids,
         closes_at=closes_at,
+        increment_selection=False,
     )
 
     blocks = polls.build_poll_blocks(poll_id, candidates)
-    resp = client.chat_postMessage(
-        channel=config.slack_channel_id,
-        blocks=blocks,
-        text="This week's lunch poll is up!",
-    )
+    try:
+        resp = client.chat_postMessage(
+            channel=config.slack_channel_id,
+            blocks=blocks,
+            text="This week's lunch poll is up!",
+        )
+    except Exception as exc:
+        # Post failed: roll back the poll so no open poll with no Slack ts is left
+        # behind (the close job would otherwise close an orphan), and do NOT
+        # increment times_selected.
+        db.delete_poll(conn, poll_id)
+        logger.error("Failed to post weekly poll %s; rolled it back (%s).", poll_id, exc)
+        return None
+
     ts = resp.get("ts")
     if ts:
         db.set_poll_ts(conn, poll_id, ts)
+    # Only now that the poll is live do we consume the selection.
+    db.increment_selection_counts(conn, option_ids)
     logger.info("Posted weekly poll %s with %d options", poll_id, len(candidates))
     return poll_id
 
