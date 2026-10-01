@@ -64,6 +64,49 @@ def test_upsert_does_not_match_already_validated_rows(tmp_path):
     assert conn.execute("SELECT COUNT(*) AS c FROM restaurants").fetchone()["c"] == 2
 
 
+def test_soft_remove_and_reactivate_restaurant_preserves_row(tmp_path):
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    restaurant_id = db.upsert_restaurant(
+        conn, Restaurant(name="Not Actually a Restaurant", cuisine="other")
+    )
+
+    assert db.set_restaurants_active(conn, [restaurant_id], active=False) == 1
+    assert db.get_active_restaurants(conn) == []
+    assert db.get_restaurant(conn, restaurant_id).active is False
+
+    assert db.set_restaurants_active(conn, [restaurant_id], active=True) == 1
+    assert [restaurant.id for restaurant in db.get_active_restaurants(conn)] == [
+        restaurant_id
+    ]
+
+
+def test_merge_restaurants_preserves_poll_votes_and_history(tmp_path):
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    source = db.upsert_restaurant(conn, Restaurant(name="Raku duplicate"))
+    destination = db.upsert_restaurant(conn, Restaurant(name="Raku"))
+    poll_id = db.create_poll(conn, "C1", [source, destination])
+    db.record_vote_if_open(conn, poll_id, source, "U1")
+    db.record_vote_if_open(conn, poll_id, destination, "U1")
+    db.record_vote_if_open(conn, poll_id, source, "U2")
+
+    db.merge_restaurants(conn, source, destination)
+
+    assert db.get_poll_option_ids(conn, poll_id) == [destination]
+    assert db.tally_votes(conn, poll_id) == {destination: 2}
+    assert db.get_restaurant(conn, source).active is False
+
+
+def test_cancel_poll_does_not_fold_vote_totals(tmp_path):
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    poll_id, restaurant_id, _ = _two_option_poll(conn)
+    db.record_vote_if_open(conn, poll_id, restaurant_id, "U1")
+
+    assert db.cancel_poll_if_open(conn, poll_id) is True
+    assert db.get_poll(conn, poll_id)["status"] == "cancelled"
+    assert db.get_restaurant(conn, restaurant_id).total_votes == 0
+    assert db.cancel_poll_if_open(conn, poll_id) is False
+
+
 # ---------------------------------------------------------------------------
 # F3 — vote guarding.
 # ---------------------------------------------------------------------------

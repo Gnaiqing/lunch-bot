@@ -8,6 +8,9 @@
 slack_channel_id: "C03J1AVLGFM"
 # Human-readable channel name, shown in some messages (display only).
 slack_channel_name: "#dl-time-series-tabular"
+# Slack member IDs allowed to remove current-poll choices or candidate-list
+# restaurants. Everyone can add; only these managers can remove.
+manager_user_ids: ["U0AA0UMN333"]
 
 # Office location. If google_maps_api_key is set, the address is geocoded at
 # runtime; office_lat/office_lng are used as a fallback and default.
@@ -20,6 +23,8 @@ search_radius_m: 5000
 
 # Number of restaurants offered per poll (keep within 4..6).
 poll_size: 5
+# Hard limit after which no more options may be added to an open poll.
+max_poll_options: 10
 
 # Coarse budget proxy. Google Places only exposes price_level 0..4; we filter to
 # restaurants with price_level <= this value (default 2) to stay within the
@@ -33,7 +38,7 @@ exploration_c: 1.0
 # SQLite database file path (gitignored).
 db_path: "lunch_bot.db"
 
-# LLM provider for cuisine tagging + free-text suggestion parsing.
+# LLM provider for semantic routing, cuisine tagging, and conversational QA.
 # One of: "anthropic" (Claude) or "openai" (GPT). Only the SELECTED provider's
 # API key is required — set it in .env (ANTHROPIC_API_KEY or OPENAI_API_KEY).
 llm_provider: "anthropic"

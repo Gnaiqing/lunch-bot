@@ -25,6 +25,7 @@ DEFAULT_OFFICE_LAT = 43.6579
 DEFAULT_OFFICE_LNG = -79.3883
 DEFAULT_SEARCH_RADIUS_M = 5000  # 5 km
 DEFAULT_POLL_SIZE = 5  # candidates per poll; keep within 4..6
+DEFAULT_MAX_POLL_OPTIONS = 10
 DEFAULT_MAX_PRICE_LEVEL = 2  # Google price_level 0..4; <=2 ~ "economic" (<= $30 pp)
 DEFAULT_EXPLORATION_C = 1.0
 DEFAULT_DB_PATH = "lunch_bot.db"
@@ -41,6 +42,9 @@ DEFAULT_RESTAURANTS_CSV = "data/restaurants_seed.csv"  # candidate source for se
 # (C0C4DT9J75Z) is the TEST channel — set SLACK_CHANNEL_ID to it while testing.
 DEFAULT_SLACK_CHANNEL_ID = "C03J1AVLGFM"  # #dl-time-series-tabular (production)
 DEFAULT_SLACK_CHANNEL_NAME = "#dl-time-series-tabular"
+# Slack members allowed to remove candidates or poll options. This project's
+# initial manager is Naiqing; override for another workspace/group.
+DEFAULT_MANAGER_USER_IDS = ("U0AA0UMN333",)
 
 # Scheduling. Times are local to ``timezone``. ``order_deadline`` is
 # informational (used in the reminder text): the organizer places the order then,
@@ -84,6 +88,19 @@ def _as_float(value: Any, default: float) -> float:
     if value is None or value == "":
         return default
     return float(value)
+
+
+def _as_string_tuple(value: Any, default: tuple[str, ...] = ()) -> tuple[str, ...]:
+    """Parse a YAML list or comma/whitespace-separated environment value."""
+    if value is None:
+        return default
+    if isinstance(value, (list, tuple, set)):
+        values = value
+    else:
+        values = str(value).replace(",", " ").split()
+    return tuple(
+        dict.fromkeys(str(item).strip() for item in values if str(item).strip())
+    )
 
 
 def _parse_provider(value: Any, *, field_name: str = "llm_provider") -> str:
@@ -205,11 +222,13 @@ class Config:
     # --- Non-secret knobs (env or yaml) ---
     slack_channel_id: Optional[str] = DEFAULT_SLACK_CHANNEL_ID
     slack_channel_name: str = DEFAULT_SLACK_CHANNEL_NAME  # human-readable, for messages
+    manager_user_ids: tuple[str, ...] = DEFAULT_MANAGER_USER_IDS
     office_address: str = DEFAULT_OFFICE_ADDRESS
     office_lat: float = DEFAULT_OFFICE_LAT
     office_lng: float = DEFAULT_OFFICE_LNG
     search_radius_m: int = DEFAULT_SEARCH_RADIUS_M
     poll_size: int = DEFAULT_POLL_SIZE
+    max_poll_options: int = DEFAULT_MAX_POLL_OPTIONS
     max_price_level: int = DEFAULT_MAX_PRICE_LEVEL
     exploration_c: float = DEFAULT_EXPLORATION_C
     db_path: str = DEFAULT_DB_PATH
@@ -324,11 +343,19 @@ def load_config(
         # Non-secret knobs: env > yaml > default.
         slack_channel_id=pick("SLACK_CHANNEL_ID", "slack_channel_id", DEFAULT_SLACK_CHANNEL_ID),
         slack_channel_name=pick("SLACK_CHANNEL_NAME", "slack_channel_name", DEFAULT_SLACK_CHANNEL_NAME),
+        manager_user_ids=_as_string_tuple(
+            pick("SLACK_MANAGER_USER_IDS", "manager_user_ids", DEFAULT_MANAGER_USER_IDS),
+            DEFAULT_MANAGER_USER_IDS,
+        ),
         office_address=pick("OFFICE_ADDRESS", "office_address", DEFAULT_OFFICE_ADDRESS),
         office_lat=_as_float(pick("OFFICE_LAT", "office_lat", DEFAULT_OFFICE_LAT), DEFAULT_OFFICE_LAT),
         office_lng=_as_float(pick("OFFICE_LNG", "office_lng", DEFAULT_OFFICE_LNG), DEFAULT_OFFICE_LNG),
         search_radius_m=_as_int(pick("SEARCH_RADIUS_M", "search_radius_m", DEFAULT_SEARCH_RADIUS_M), DEFAULT_SEARCH_RADIUS_M),
         poll_size=_as_int(pick("POLL_SIZE", "poll_size", DEFAULT_POLL_SIZE), DEFAULT_POLL_SIZE),
+        max_poll_options=_as_int(
+            pick("MAX_POLL_OPTIONS", "max_poll_options", DEFAULT_MAX_POLL_OPTIONS),
+            DEFAULT_MAX_POLL_OPTIONS,
+        ),
         max_price_level=_as_int(pick("MAX_PRICE_LEVEL", "max_price_level", DEFAULT_MAX_PRICE_LEVEL), DEFAULT_MAX_PRICE_LEVEL),
         exploration_c=_as_float(pick("EXPLORATION_C", "exploration_c", DEFAULT_EXPLORATION_C), DEFAULT_EXPLORATION_C),
         db_path=pick("DB_PATH", "db_path", DEFAULT_DB_PATH),

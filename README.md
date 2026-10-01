@@ -50,6 +50,17 @@ Commands are conversational and accept either `poll` or `polly`:
 @lunch-bot create a poll with 4 choices
 @lunch-bot create a poll with 4 choices including Pala 148
 @lunch-bot add a pizza restaurant to this week's poll
+@lunch-bot remove Miznon from the current poll
+@lunch-bot remove all items in other from the candidate list
+@lunch-bot close the current poll
+@lunch-bot close the current poll and start a new poll with 4 choices
+@lunch-bot cancel the current poll
+@lunch-bot show removed restaurants
+@lunch-bot restore Scotland Yard Pub to the candidate list
+@lunch-bot rename Old Name to New Name
+@lunch-bot change Miznon's cuisine to Mediterranean
+@lunch-bot merge Raku duplicate into Raku
+@lunch-bot refresh Miznon's Google Maps location
 @lunch-bot show the current poll
 @lunch-bot where is Miznon? Can you provide its Google Maps link?
 ```
@@ -60,6 +71,23 @@ posting a new week's poll. Adding a named restaurant first uses the existing
 candidate pool; if it is not present, the bot validates it
 through Google Places and adds it. A cuisine request such as “pizza restaurant”
 selects a matching candidate that is not already in the poll.
+
+Everyone may add restaurants to either collection. Adding a restaurant to the
+current poll also keeps it in the reusable candidate list. Only Slack users in
+`manager_user_ids` / `SLACK_MANAGER_USER_IDS` may remove entries. Removing from
+the current poll leaves the restaurant in the candidate list; removing from the
+candidate list soft-deactivates it and also removes it from an open poll, if
+present. Managers may also close the current poll, optionally followed by
+creating a replacement poll in the same command. Closing disables voting,
+records the final tally, and announces the winner. Historical poll records are
+retained.
+
+Bulk removals show a persisted confirmation card before changing anything.
+Managers can list and restore inactive candidates, rename restaurants, change
+cuisine labels, refresh a Google Maps match through the normal confirmation
+flow, and merge duplicate records while preserving poll/vote history. Polls are
+limited to `max_poll_options` choices (default 10). Cancelling a poll disables
+voting without selecting a winner or folding its votes into preference history.
 
 An LLM classifies conversational requests into a strict command schema. Trusted
 application code validates that schema and performs all channel checks,
@@ -219,6 +247,9 @@ cp config.example.yaml config.yaml # adjust non-secret knobs (both .env and conf
 ```
 
 Environment variables override `config.yaml`. Secrets belong in `.env` only.
+Set `SLACK_MANAGER_USER_IDS` to a comma- or space-separated list of Slack member
+IDs allowed to remove candidates and current-poll choices. The project default
+is Naiqing's member ID (`U0AA0UMN333`).
 
 ## Install & run locally
 

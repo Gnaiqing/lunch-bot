@@ -83,6 +83,30 @@ def test_add_to_candidate_list():
     assert command.queries == ["Raku"]
 
 
+def test_remove_from_poll_and_candidate_category():
+    command = parse_mention_command("remove Miznon from the current poll")
+    assert command.kind == "remove_from_poll"
+    assert command.queries == ["Miznon"]
+
+    command = parse_mention_command(
+        "remove all items in other from the candidate list"
+    )
+    assert command.kind == "remove_from_pool"
+    assert command.queries == []
+    assert command.cuisines == ["other"]
+
+
+def test_close_poll_and_close_then_create_poll():
+    command = parse_mention_command("close the current poll")
+    assert command.kind == "close_poll"
+
+    command = parse_mention_command(
+        "Close the current poll. Start a new poll with 4 choices"
+    )
+    assert command.kind == "close_and_create_poll"
+    assert command.count == 4
+
+
 def test_match_restaurant_name_before_cuisine():
     pool = [
         Restaurant(id=1, name="Pala 148", cuisine="Pizza"),
@@ -125,6 +149,41 @@ def test_semantic_route_preserves_full_name_and_cuisine_types():
     )
     assert cuisine.queries == []
     assert cuisine.cuisines == ["pizza"]
+
+
+def test_semantic_route_supports_scoped_removal():
+    pool = parse_semantic_route(
+        _route(
+            intent="remove_from_pool",
+            mode="execute",
+            cuisines=["other"],
+        )
+    )
+    assert pool.kind == "remove_from_pool"
+    assert pool.cuisines == ["other"]
+
+    poll = parse_semantic_route(
+        _route(
+            intent="remove_from_poll",
+            mode="execute",
+            restaurant_names=["Miznon"],
+        )
+    )
+    assert poll.kind == "remove_from_poll"
+    assert poll.queries == ["Miznon"]
+
+
+def test_semantic_route_supports_manager_poll_close_actions():
+    close = parse_semantic_route(
+        _route(intent="close_poll", mode="execute")
+    )
+    assert close.kind == "close_poll"
+
+    replace = parse_semantic_route(
+        _route(intent="close_and_create_poll", mode="execute", count=4)
+    )
+    assert replace.kind == "close_and_create_poll"
+    assert replace.count == 4
 
 
 @pytest.mark.parametrize("flag", ["negated", "hypothetical"])

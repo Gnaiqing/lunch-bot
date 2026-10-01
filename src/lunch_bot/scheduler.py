@@ -68,7 +68,10 @@ def create_weekly_poll(
         return None
 
     requested_size = poll_size if poll_size is not None else config.poll_size
-    required_ids = list(dict.fromkeys(required_restaurant_ids or []))
+    requested_size = min(requested_size, config.max_poll_options)
+    required_ids = list(dict.fromkeys(required_restaurant_ids or []))[
+        : config.max_poll_options
+    ]
     active_by_id = {restaurant.id: restaurant for restaurant in active}
     required = [active_by_id[rid] for rid in required_ids if rid in active_by_id]
     requested_size = max(requested_size, len(required))
@@ -134,7 +137,9 @@ def create_weekly_poll(
     return poll_id
 
 
-def close_poll_and_announce(config: Config, conn, client, *, reading_group_time: str | None = None):
+def close_poll_and_announce(
+    config: Config, conn, client, *, reading_group_time: str | None = None
+) -> bool:
     """Close the open poll, record votes, announce the winner, and prompt prep.
 
     Folds the poll's votes into each restaurant's ``total_votes`` (and
@@ -147,7 +152,7 @@ def close_poll_and_announce(config: Config, conn, client, *, reading_group_time:
     open_poll = db.get_open_poll(conn, config.slack_channel_id)
     if not open_poll:
         logger.warning("No open poll to close + announce.")
-        return
+        return False
     poll_id = open_poll["id"]
 
     # Close + tally + winner selection happen in ONE atomic DB operation that
@@ -158,14 +163,36 @@ def close_poll_and_announce(config: Config, conn, client, *, reading_group_time:
     applied, winner_id = db.close_poll_and_tally(conn, poll_id)
     if not applied:
         logger.warning("Poll %s was already closed; skipping tally + announce.", poll_id)
-        return
+        return False
+
+    # Disable the original vote buttons and show the final tally. Failure to
+    # refresh Slack must not reopen an already atomically closed poll.
+    if open_poll["slack_ts"]:
+        option_ids = db.get_poll_option_ids(conn, poll_id)
+        restaurants = [db.get_restaurant(conn, restaurant_id) for restaurant_id in option_ids]
+        restaurants = [restaurant for restaurant in restaurants if restaurant is not None]
+        try:
+            client.chat_update(
+                channel=config.slack_channel_id,
+                ts=open_poll["slack_ts"],
+                blocks=polls.build_poll_blocks(
+                    poll_id,
+                    restaurants,
+                    tally=db.tally_votes(conn, poll_id),
+                    voters=db.get_poll_voters(conn, poll_id),
+                    closed=True,
+                ),
+                text="Lunch poll closed",
+            )
+        except Exception as exc:  # pragma: no cover - Slack network best-effort
+            logger.warning("Closed poll %s but could not refresh its Slack message: %s", poll_id, exc)
 
     if winner_id is None:
         client.chat_postMessage(
             channel=config.slack_channel_id,
             text="No votes were cast this week — no lunch winner. 😢",
         )
-        return
+        return True
 
     winner = db.get_restaurant(conn, winner_id)
     summary = build_order_summary(winner, reading_group_time=reading_group_time)
@@ -175,6 +202,7 @@ def close_poll_and_announce(config: Config, conn, client, *, reading_group_time:
         text=summary["text"],
     )
     logger.info("Announced winner %s for poll %s", winner.name, poll_id)
+    return True
 
 
 def send_order_reminder(config: Config, conn, client):

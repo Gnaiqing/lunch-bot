@@ -32,11 +32,38 @@ COMMAND_KINDS = frozenset(
         "create_poll",
         "add_to_poll",
         "add_to_pool",
+        "remove_from_poll",
+        "remove_from_pool",
+        "close_poll",
+        "close_and_create_poll",
+        "cancel_poll",
+        "list_inactive",
+        "restore_to_pool",
+        "rename_restaurant",
+        "change_cuisine",
+        "refresh_location",
+        "merge_restaurants",
         "conversation",
         "clarify",
     }
 )
-MUTATING_COMMAND_KINDS = frozenset({"create_poll", "add_to_poll", "add_to_pool"})
+MUTATING_COMMAND_KINDS = frozenset(
+    {
+        "create_poll",
+        "add_to_poll",
+        "add_to_pool",
+        "remove_from_poll",
+        "remove_from_pool",
+        "close_poll",
+        "close_and_create_poll",
+        "cancel_poll",
+        "restore_to_pool",
+        "rename_restaurant",
+        "change_cuisine",
+        "refresh_location",
+        "merge_restaurants",
+    }
+)
 
 
 _NUMBER_WORDS = {
@@ -120,7 +147,12 @@ def parse_semantic_route(raw: str) -> MentionCommand:
             )
         return MentionCommand("conversation")
 
-    if intent in {"add_to_poll", "add_to_pool"} and not (names or cuisines):
+    if intent in {
+        "add_to_poll",
+        "add_to_pool",
+        "remove_from_poll",
+        "remove_from_pool",
+    } and not (names or cuisines):
         return MentionCommand(
             "clarify", clarification="Which restaurant or cuisine did you mean?"
         )
@@ -131,6 +163,17 @@ def parse_semantic_route(raw: str) -> MentionCommand:
         )
     if intent == "restaurant_location" and len(names) != 1:
         return MentionCommand("clarify", clarification="Which restaurant location do you mean?")
+    required_name_counts = {
+        "rename_restaurant": 2,
+        "change_cuisine": 1,
+        "merge_restaurants": 2,
+    }
+    if intent in required_name_counts and len(names) != required_name_counts[intent]:
+        return MentionCommand("clarify", clarification="Please specify the restaurant names explicitly.")
+    if intent == "change_cuisine" and len(cuisines) != 1:
+        return MentionCommand("clarify", clarification="Which cuisine should I assign?")
+    if intent == "refresh_location" and len(names) not in {1, 2}:
+        return MentionCommand("clarify", clarification="Which restaurant location should I refresh?")
     if intent not in MUTATING_COMMAND_KINDS and mode == "execute":
         raise ValueError("read-only intent cannot use execute mode")
 
@@ -154,6 +197,25 @@ def _split_queries(value: str) -> list[str]:
     value = re.sub(r"^(?:choices?|options?)\s+(?:of\s+)?", "", value, flags=re.I)
     parts = re.split(r"\s*,\s*|\s+and\s+", value)
     return [query for part in parts if (query := _clean_query(part))]
+
+
+def _removal_entities(value: str) -> tuple[list[str], list[str]]:
+    """Extract legacy name/category removal targets without guessing pronouns."""
+    value = value.strip()
+    category = re.fullmatch(
+        r"(?:all\s+)?(?:items?|restaurants?|candidates?|choices?|options?)\s+"
+        r"(?:listed\s+|categorized\s+)?(?:in|under)\s+(?:the\s+)?"
+        r"(?:category\s+)?(.+)",
+        value,
+        re.I,
+    )
+    if category:
+        return [], [_clean_query(category.group(1))]
+    category = re.fullmatch(r"(?:all\s+)?(?:the\s+)?(.+?)\s+category", value, re.I)
+    if category:
+        return [], [_clean_query(category.group(1))]
+    value = re.sub(r"^(?:all\s+)?", "", value, flags=re.I)
+    return _split_queries(value), []
 
 
 def _extract_count(text: str) -> int | None:
@@ -194,6 +256,88 @@ def parse_mention_command(text: str) -> MentionCommand:
             return MentionCommand(
                 "restaurant_location", queries=[_clean_query(location.group(1))]
             )
+
+    remove_from_poll = re.search(
+        r"\b(?:remove|delete|drop)\s+(.+?)\s+from\s+(?:the\s+)?"
+        r"(?:current\s+|open\s+|existing\s+|this week(?:['’]s)?\s+)?"
+        + _POLL
+        + r"\b",
+        text,
+        re.I,
+    )
+    if remove_from_poll:
+        names, cuisines = _removal_entities(remove_from_poll.group(1))
+        return MentionCommand("remove_from_poll", queries=names, cuisines=cuisines)
+
+    remove_from_pool = re.search(
+        r"\b(?:remove|delete|deactivate)\s+(.+?)\s+from\s+(?:the\s+)?"
+        r"(?:candidate\s+list|restaurant\s+(?:list|pool)|candidates?|pool)\b",
+        text,
+        re.I,
+    )
+    if remove_from_pool:
+        names, cuisines = _removal_entities(remove_from_pool.group(1))
+        return MentionCommand("remove_from_pool", queries=names, cuisines=cuisines)
+
+    if re.search(r"\b(?:show|list)\b.*\b(?:inactive|removed|archived)\b", lowered):
+        return MentionCommand("list_inactive")
+
+    restore = re.search(
+        r"\b(?:restore|reactivate)\s+(.+?)\s+(?:to|in)\s+(?:the\s+)?"
+        r"(?:candidate\s+list|restaurant\s+(?:list|pool)|pool)\b",
+        text,
+        re.I,
+    )
+    if restore:
+        names, cuisines = _removal_entities(restore.group(1))
+        return MentionCommand("restore_to_pool", queries=names, cuisines=cuisines)
+
+    rename = re.search(r"\brename\s+(.+?)\s+to\s+(.+?)(?:[.!?]|$)", text, re.I)
+    if rename:
+        return MentionCommand(
+            "rename_restaurant",
+            queries=[_clean_query(rename.group(1)), _clean_query(rename.group(2))],
+        )
+
+    cuisine_change = re.search(
+        r"\b(?:change|set)\s+(.+?)(?:['’]s|\s+)\s+cuisine\s+to\s+(.+?)(?:[.!?]|$)",
+        text,
+        re.I,
+    )
+    if cuisine_change:
+        return MentionCommand(
+            "change_cuisine",
+            queries=[_clean_query(cuisine_change.group(1))],
+            cuisines=[_clean_query(cuisine_change.group(2))],
+        )
+
+    merge = re.search(r"\bmerge\s+(.+?)\s+(?:into|with)\s+(.+?)(?:[.!?]|$)", text, re.I)
+    if merge:
+        return MentionCommand(
+            "merge_restaurants",
+            queries=[_clean_query(merge.group(1)), _clean_query(merge.group(2))],
+        )
+
+    refresh = re.search(
+        r"\b(?:refresh|replace|update)\s+(.+?)(?:['’]s|\s+)\s+"
+        r"(?:google\s+maps?\s+)?(?:location|map(?:s)?\s+link)\b",
+        text,
+        re.I,
+    )
+    if refresh:
+        return MentionCommand("refresh_location", queries=[_clean_query(refresh.group(1))])
+
+    if re.search(r"\bclose\b.*\b" + _POLL + r"\b", lowered):
+        count = _extract_count(text)
+        if re.search(
+            r"\b(?:start|create|make|open|post)\b.*\b" + _POLL + r"\b",
+            lowered,
+        ):
+            return MentionCommand("close_and_create_poll", count=count)
+        return MentionCommand("close_poll")
+
+    if re.search(r"\b(?:cancel|discard)\b.*\b" + _POLL + r"\b", lowered):
+        return MentionCommand("cancel_poll")
 
     if re.search(r"\b(list|show|what|which)\b.*\b(restaurants?|candidates?|pool)\b", lowered) and not re.search(
         _POLL, lowered
