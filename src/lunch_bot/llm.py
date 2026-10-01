@@ -73,11 +73,13 @@ class LLMClient:
             "create_poll, add_to_poll, add_to_pool, remove_from_poll, remove_from_pool, "
             "close_poll, close_and_create_poll, cancel_poll, list_inactive, restore_to_pool, "
             "rename_restaurant, change_cuisine, refresh_location, merge_restaurants, "
-            "conversation, and clarify. The candidate list is the reusable set of all "
+            "send_order_reminder, conversation, and clarify. The candidate list is the "
+            "reusable set of all "
             "active restaurants. The current poll is only this week's selectable subset. "
             "Use mode=execute only for an explicit affirmative request to create a poll, "
             "add/remove a current-poll option, add/remove/restore/edit/merge candidate "
             "restaurants, refresh a location, or close/cancel a poll. "
+            "Use send_order_reminder only when explicitly asked to post the ordering reminder. "
             "Questions about how an action works use mode=answer and conversation. "
             "Set negated or hypothetical when applicable; those requests must not execute. "
             "Set ambiguous when the intended action or referenced entity is unclear. "
@@ -252,6 +254,7 @@ class OpenAIClient(LLMClient):
                             "change_cuisine",
                             "refresh_location",
                             "merge_restaurants",
+                            "send_order_reminder",
                             "conversation",
                             "clarify",
                         ]

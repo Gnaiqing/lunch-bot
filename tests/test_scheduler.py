@@ -192,3 +192,40 @@ def test_manual_poll_size_and_required_choice(tmp_path):
     option_ids = db.get_poll_option_ids(conn, poll_id)
     assert len(option_ids) == 4
     assert ids[-1] in option_ids
+
+
+def test_poll_creation_never_discovers_or_reactivates_removed_candidates(
+    monkeypatch, tmp_path
+):
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    active_ids = _seed(conn, n=4)
+    removed_id = db.upsert_restaurant(
+        conn,
+        Restaurant(
+            name="InterContinental Toronto Centre by IHG",
+            cuisine="other",
+            place_id="hotel-place",
+            active=False,
+        ),
+    )
+    config = load_config(
+        env={
+            "SLACK_CHANNEL_ID": "C_TEST",
+            "GOOGLE_MAPS_API_KEY": "configured-but-must-not-be-used",
+            "POLL_SIZE": "4",
+        },
+        load_dotenv=False,
+        config_path="__none__.yaml",
+    )
+    monkeypatch.setattr(
+        "lunch_bot.discovery.discover_and_store",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("poll creation must not run discovery")
+        ),
+    )
+
+    poll_id = scheduler.create_weekly_poll(config, conn, _OkClient())
+
+    assert set(db.get_poll_option_ids(conn, poll_id)) == set(active_ids)
+    assert removed_id not in db.get_poll_option_ids(conn, poll_id)
+    assert db.get_restaurant(conn, removed_id).active is False

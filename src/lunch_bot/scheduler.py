@@ -37,30 +37,16 @@ def create_weekly_poll(
     conn,
     client,
     *,
-    llm=None,
     poll_size: int | None = None,
     required_restaurant_ids: list[int] | None = None,
 ) -> int | None:
     """Select candidates and post the poll-create-day poll to the channel.
 
-    Runs a Google Places discovery pass first (when a Maps API key is
-    configured) so the pool is refreshed before candidates are chosen — a fresh,
-    empty DB would otherwise have nothing to offer. Discovery is best-effort: if
-    no key is set, or the API call fails, it logs and continues with the existing
-    pool. Returns the new poll id, or ``None`` if there was nothing to offer.
+    Selection is intentionally limited to the current active candidate list.
+    Poll creation never runs Google Places discovery or silently adds/reactivates
+    restaurants. Returns the new poll id, or ``None`` if the list is empty.
     """
     config.require("slack_channel_id")
-
-    if config.google_maps_api_key:
-        try:
-            from .discovery import discover_and_store  # lazy: pulls in googlemaps
-
-            added = discover_and_store(conn, config, llm=llm)
-            logger.info("Discovery pass touched %d restaurants before poll creation", added)
-        except Exception as exc:
-            logger.warning("Discovery failed (%s); continuing with existing pool.", exc)
-    else:
-        logger.info("No Google Maps API key configured; skipping discovery, using existing pool.")
 
     active = db.get_active_restaurants(conn)
     if not active:
@@ -228,10 +214,10 @@ def build_scheduler(config: Config, conn, client, *, llm=None):
 
     Builds cron triggers from ``config.schedule`` (poll_create / poll_close /
     order_reminder) using ``config.timezone``. ``order_deadline`` is
-    informational only and is NOT scheduled. ``llm`` (optional) is passed to the
-    poll-create job so its discovery pass can tag cuisines. The caller is
-    responsible for ``scheduler.start()`` and keeping the process alive (see
-    :mod:`lunch_bot.main`).
+    informational only and is NOT scheduled. ``llm`` remains an accepted
+    compatibility argument but poll creation does not perform discovery. The
+    caller is responsible for ``scheduler.start()`` and keeping the process
+    alive (see :mod:`lunch_bot.main`).
     """
     from apscheduler.schedulers.background import BackgroundScheduler  # lazy
     from apscheduler.triggers.cron import CronTrigger  # lazy
@@ -239,7 +225,7 @@ def build_scheduler(config: Config, conn, client, *, llm=None):
     scheduler = BackgroundScheduler(timezone=config.timezone)
 
     jobs = (
-        ("poll_create", lambda: create_weekly_poll(config, conn, client, llm=llm)),
+        ("poll_create", lambda: create_weekly_poll(config, conn, client)),
         ("poll_close", lambda: close_poll_and_announce(config, conn, client)),
         ("order_reminder", lambda: send_order_reminder(config, conn, client)),
     )

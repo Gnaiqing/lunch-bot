@@ -105,18 +105,27 @@ def main() -> None:
 
     app = build_app(config, conn, llm=llm)
 
-    scheduler = build_scheduler(config, conn, app.client, llm=llm)
-    scheduler.start()
-    sched = config.schedule
-    logger.info(
-        "Scheduler started (poll_create %s %s, poll_close %s %s, order_reminder %s %s; "
-        "order_deadline %s %s [human, no job]; tz=%s)",
-        sched["poll_create"].day, sched["poll_create"].time_str,
-        sched["poll_close"].day, sched["poll_close"].time_str,
-        sched["order_reminder"].day, sched["order_reminder"].time_str,
-        sched["order_deadline"].day, sched["order_deadline"].time_str,
-        config.timezone,
-    )
+    if config.scheduler_enabled:
+        scheduler = build_scheduler(config, conn, app.client, llm=llm)
+        scheduler.start()
+        sched = config.schedule
+        logger.info(
+            "Scheduler started (poll_create %s %s, poll_close %s %s, "
+            "order_reminder %s %s; order_deadline %s %s [human, no job]; tz=%s)",
+            sched["poll_create"].day,
+            sched["poll_create"].time_str,
+            sched["poll_close"].day,
+            sched["poll_close"].time_str,
+            sched["order_reminder"].day,
+            sched["order_reminder"].time_str,
+            sched["order_deadline"].day,
+            sched["order_deadline"].time_str,
+            config.timezone,
+        )
+    else:
+        logger.info(
+            "Automatic scheduler disabled; polls and reminders require explicit commands."
+        )
 
     handler = SocketModeHandler(app, config.slack_app_token)
     logger.info("Starting Slack Socket Mode handler…")

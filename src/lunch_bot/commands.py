@@ -43,6 +43,7 @@ COMMAND_KINDS = frozenset(
         "change_cuisine",
         "refresh_location",
         "merge_restaurants",
+        "send_order_reminder",
         "conversation",
         "clarify",
     }
@@ -62,6 +63,7 @@ MUTATING_COMMAND_KINDS = frozenset(
         "change_cuisine",
         "refresh_location",
         "merge_restaurants",
+        "send_order_reminder",
     }
 )
 
@@ -338,6 +340,12 @@ def parse_mention_command(text: str) -> MentionCommand:
 
     if re.search(r"\b(?:cancel|discard)\b.*\b" + _POLL + r"\b", lowered):
         return MentionCommand("cancel_poll")
+
+    if re.search(
+        r"\b(?:send|post|publish)\b.*\b(?:order|lunch)\b.*\breminder\b",
+        lowered,
+    ):
+        return MentionCommand("send_order_reminder")
 
     if re.search(r"\b(list|show|what|which)\b.*\b(restaurants?|candidates?|pool)\b", lowered) and not re.search(
         _POLL, lowered

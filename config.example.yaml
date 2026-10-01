@@ -12,6 +12,10 @@ slack_channel_name: "#dl-time-series-tabular"
 # restaurants. Everyone can add; only these managers can remove.
 manager_user_ids: ["U0AA0UMN333"]
 
+# Disabled by default: polls and reminders are triggered with explicit Slack
+# commands. Set true to restore the cron schedule below.
+scheduler_enabled: false
+
 # Office location. If google_maps_api_key is set, the address is geocoded at
 # runtime; office_lat/office_lng are used as a fallback and default.
 office_address: "661 University Ave, Toronto"

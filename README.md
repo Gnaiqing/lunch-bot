@@ -5,7 +5,7 @@
 CI runs the `pytest` suite on every push and pull request.
 
 A Slack bot that runs a weekly lunch-decision workflow for a reading group: it
-discovers nearby restaurants, posts a diversity-aware poll, records votes,
+validates explicitly suggested restaurants, posts a diversity-aware poll, records votes,
 announces the winner, and reminds the group to order — while the **organizer**
 (a human) creates and places the actual Uber Eats group order.
 
@@ -23,7 +23,8 @@ group* below).
 
 ## Weekly flow
 
-All days/times are configurable per group (defaults shown; times local to
+Automatic scheduling is currently disabled by default. If explicitly enabled,
+all days/times are configurable per group (defaults shown; times local to
 `timezone`, default `America/Toronto`):
 
 | When | What happens |
@@ -55,6 +56,7 @@ Commands are conversational and accept either `poll` or `polly`:
 @lunch-bot close the current poll
 @lunch-bot close the current poll and start a new poll with 4 choices
 @lunch-bot cancel the current poll
+@lunch-bot send the order reminder
 @lunch-bot show removed restaurants
 @lunch-bot restore Scotland Yard Pub to the candidate list
 @lunch-bot rename Old Name to New Name
@@ -81,6 +83,18 @@ present. Managers may also close the current poll, optionally followed by
 creating a replacement poll in the same command. Closing disables voting,
 records the final tally, and announces the winner. Historical poll records are
 retained.
+
+Poll creation selects exclusively from the currently active candidate list. It
+does not run automatic Google Places discovery, add new restaurants, or
+reactivate removed candidates. A restaurant can enter the pool only through an
+explicit user addition followed by Google Maps confirmation (or a manager
+restore of an inactive candidate).
+
+Automatic scheduling is disabled by default (`scheduler_enabled: false` or
+`SCHEDULER_ENABLED=false`). Managers explicitly close/cancel polls and send the
+order reminder; poll creation remains an explicit Slack command available to
+members. Set the flag to `true` to restore the configured create/close/reminder
+cron jobs.
 
 Bulk removals show a persisted confirmation card before changing anything.
 Managers can list and restore inactive candidates, rename restaurants, change
@@ -128,7 +142,8 @@ APScheduler  ─────────┤
 - **Scheduling:** `APScheduler` (three configurable cron jobs: poll create /
   poll close+announce / order reminder).
 - **Storage:** SQLite via the stdlib `sqlite3` (single file, path configurable, gitignored).
-- **Discovery:** Google Places Nearby Search + Geocoding (`googlemaps`).
+- **Validation:** Google Places search + Geocoding (`googlemaps`) for explicit
+  additions and location corrections; poll creation never runs discovery.
 - **LLM:** pluggable provider (`llm_provider`) — Anthropic `anthropic` SDK
   (`claude-haiku-4-5`, default) or OpenAI `openai` SDK (`gpt-4o-mini`), both
   fast/cheap, for semantic routing, cuisine tagging, conversational QA, and

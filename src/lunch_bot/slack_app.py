@@ -304,7 +304,8 @@ def build_app(config: Config, conn, llm=None):
         )
         return (
             f"Configured channel: {config.slack_channel_name}.\n"
-            f"Weekly schedule: poll {config.schedule['poll_create'].day} "
+            f"Automatic scheduler enabled: {config.scheduler_enabled}. "
+            f"Configured schedule (used only when enabled): poll {config.schedule['poll_create'].day} "
             f"{config.schedule['poll_create'].time_str}, close "
             f"{config.schedule['poll_close'].day} {config.schedule['poll_close'].time_str}, "
             f"timezone {config.timezone}.\n"
@@ -397,7 +398,6 @@ def build_app(config: Config, conn, llm=None):
             config,
             conn,
             client,
-            llm=llm,
             poll_size=count,
             required_restaurant_ids=required_ids,
         )
@@ -806,6 +806,7 @@ def build_app(config: Config, conn, llm=None):
             "close_poll",
             "close_and_create_poll",
             "cancel_poll",
+            "send_order_reminder",
         } and event.get("channel") != config.slack_channel_id:
             say(f"Polls can only be managed in {config.slack_channel_name}.")
             return
@@ -821,6 +822,7 @@ def build_app(config: Config, conn, llm=None):
             "change_cuisine",
             "refresh_location",
             "merge_restaurants",
+            "send_order_reminder",
         } and not is_manager(event.get("user")):
             say(
                 "Only a configured lunch-bot manager can remove poll choices or candidates, "
@@ -841,6 +843,7 @@ def build_app(config: Config, conn, llm=None):
                 "• `@lunch-bot close the current poll` *(manager only)*\n"
                 "• `@lunch-bot close the current poll and start a new poll with 4 choices` *(manager only)*\n"
                 "• `@lunch-bot cancel the current poll` *(manager only)*\n"
+                "• `@lunch-bot send the order reminder` *(manager only)*\n"
                 "• `@lunch-bot show removed restaurants` / `restore <name> to the candidate list` *(manager only)*\n"
                 "• `@lunch-bot rename <old name> to <new name>` *(manager only)*\n"
                 "• `@lunch-bot change <name>'s cuisine to <cuisine>` *(manager only)*\n"
@@ -906,6 +909,16 @@ def build_app(config: Config, conn, llm=None):
             return
         if command.kind == "cancel_poll":
             handle_cancel_poll(say, client)
+            return
+        if command.kind == "send_order_reminder":
+            from .scheduler import send_order_reminder
+
+            try:
+                send_order_reminder(config, conn, client)
+            except Exception as exc:  # pragma: no cover - Slack network best-effort
+                say(f"I couldn't send the order reminder: {exc}")
+                return
+            say("Sent the order reminder.")
             return
         if command.kind == "restore_to_pool":
             handle_restore(command, say)

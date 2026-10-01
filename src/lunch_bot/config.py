@@ -45,6 +45,7 @@ DEFAULT_SLACK_CHANNEL_NAME = "#dl-time-series-tabular"
 # Slack members allowed to remove candidates or poll options. This project's
 # initial manager is Naiqing; override for another workspace/group.
 DEFAULT_MANAGER_USER_IDS = ("U0AA0UMN333",)
+DEFAULT_SCHEDULER_ENABLED = False
 
 # Scheduling. Times are local to ``timezone``. ``order_deadline`` is
 # informational (used in the reminder text): the organizer places the order then,
@@ -223,6 +224,7 @@ class Config:
     slack_channel_id: Optional[str] = DEFAULT_SLACK_CHANNEL_ID
     slack_channel_name: str = DEFAULT_SLACK_CHANNEL_NAME  # human-readable, for messages
     manager_user_ids: tuple[str, ...] = DEFAULT_MANAGER_USER_IDS
+    scheduler_enabled: bool = DEFAULT_SCHEDULER_ENABLED
     office_address: str = DEFAULT_OFFICE_ADDRESS
     office_lat: float = DEFAULT_OFFICE_LAT
     office_lng: float = DEFAULT_OFFICE_LNG
@@ -346,6 +348,10 @@ def load_config(
         manager_user_ids=_as_string_tuple(
             pick("SLACK_MANAGER_USER_IDS", "manager_user_ids", DEFAULT_MANAGER_USER_IDS),
             DEFAULT_MANAGER_USER_IDS,
+        ),
+        scheduler_enabled=_as_bool(
+            pick("SCHEDULER_ENABLED", "scheduler_enabled", DEFAULT_SCHEDULER_ENABLED),
+            DEFAULT_SCHEDULER_ENABLED,
         ),
         office_address=pick("OFFICE_ADDRESS", "office_address", DEFAULT_OFFICE_ADDRESS),
         office_lat=_as_float(pick("OFFICE_LAT", "office_lat", DEFAULT_OFFICE_LAT), DEFAULT_OFFICE_LAT),

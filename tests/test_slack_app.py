@@ -1041,3 +1041,38 @@ def test_manager_refreshes_location_after_google_confirmation(monkeypatch, tmp_p
     assert updated.address == "123 Bay St"
     assert updated.maps_url == "https://maps.example/new"
     assert len(conn.execute("SELECT * FROM restaurants").fetchall()) == 1
+
+
+def test_only_manager_can_send_manual_order_reminder(monkeypatch, tmp_path):
+    monkeypatch.setattr("slack_bolt.App", _FakeBoltApp)
+    config = load_config(
+        env={
+            "SLACK_BOT_TOKEN": "xoxb-test",
+            "SLACK_CHANNEL_ID": "C_TEST",
+            "SLACK_MANAGER_USER_IDS": "U_MANAGER",
+        },
+        load_dotenv=False,
+        config_path="__none__.yaml",
+    )
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    command = MentionCommand("send_order_reminder")
+    app = build_app(config, conn, llm=_FixedRouter(command))
+    client = _FakeSlackClient()
+    replies = []
+
+    app.events["app_mention"](
+        event={"channel": "C_TEST", "user": "U_MEMBER", "text": "send reminder"},
+        say=replies.append,
+        client=client,
+    )
+    assert client.posts == []
+    assert "Only a configured lunch-bot manager" in replies[-1]
+
+    app.events["app_mention"](
+        event={"channel": "C_TEST", "user": "U_MANAGER", "text": "send reminder"},
+        say=replies.append,
+        client=client,
+    )
+    assert len(client.posts) == 1
+    assert client.posts[0]["text"].startswith("Reminder: place your lunch orders")
+    assert replies[-1] == "Sent the order reminder."

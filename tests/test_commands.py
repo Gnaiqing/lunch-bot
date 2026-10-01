@@ -107,6 +107,11 @@ def test_close_poll_and_close_then_create_poll():
     assert command.count == 4
 
 
+def test_manual_order_reminder_command():
+    command = parse_mention_command("send the order reminder")
+    assert command.kind == "send_order_reminder"
+
+
 def test_match_restaurant_name_before_cuisine():
     pool = [
         Restaurant(id=1, name="Pala 148", cuisine="Pizza"),
