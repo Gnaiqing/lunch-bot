@@ -22,7 +22,11 @@ import re
 import uuid
 
 from . import db, polls
-from .commands import MentionCommand, match_restaurants, parse_mention_command
+from .commands import (
+    MUTATING_COMMAND_KINDS,
+    MentionCommand,
+    parse_mention_command,
+)
 from .config import Config
 from .models import Restaurant
 from .selection import select_candidates
@@ -172,22 +176,52 @@ def build_app(config: Config, conn, llm=None):
             return False, "I found a match but couldn't post the confirmation card."
         return True, None
 
-    def choose_from_pool(query: str, *, excluding: set[int] | None = None):
-        """Resolve a name/cuisine query to one active restaurant."""
+    def choose_from_pool(
+        query: str,
+        *,
+        excluding: set[int] | None = None,
+        cuisine: bool = False,
+    ) -> tuple[Restaurant | None, list[str]]:
+        """Resolve one entity, returning ambiguity instead of guessing a name."""
         excluding = excluding or set()
-        matches = [
-            restaurant
-            for restaurant in match_restaurants(db.get_active_restaurants(conn), query)
+        available = [
+            restaurant for restaurant in db.get_active_restaurants(conn)
             if restaurant.id not in excluding
         ]
+        if cuisine:
+            needle = re.sub(r"[^a-z0-9]+", " ", query.casefold()).strip()
+            matches = [
+                restaurant for restaurant in available
+                if re.sub(r"[^a-z0-9]+", " ", (restaurant.cuisine or "").casefold()).strip()
+                == needle
+            ]
+        else:
+            needle = re.sub(r"[^a-z0-9]+", " ", query.casefold()).strip()
+            def normalized(value: str) -> str:
+                return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+
+            matches = [
+                restaurant
+                for restaurant in available
+                if normalized(restaurant.name) == needle
+            ]
+            if not matches:
+                matches = [
+                    restaurant
+                    for restaurant in available
+                    if needle in normalized(restaurant.name)
+                ]
         if not matches:
-            return None
-        return select_candidates(
+            return None, []
+        if not cuisine and len(matches) > 1:
+            return None, [restaurant.name for restaurant in matches]
+        selected = select_candidates(
             matches,
             n=1,
             rng=random.Random(),
             exploration_c=config.exploration_c,
         )[0]
+        return selected, []
 
     def restaurant_list_text() -> str:
         restaurants = sorted(
@@ -221,7 +255,10 @@ def build_app(config: Config, conn, llm=None):
         restaurants = sorted(
             db.get_active_restaurants(conn), key=lambda restaurant: restaurant.name.casefold()
         )
-        names = ", ".join(restaurant.name for restaurant in restaurants)
+        names = ", ".join(
+            f"{restaurant.name} [{restaurant.cuisine or 'Other'}]"
+            for restaurant in restaurants
+        )
         return (
             f"Configured channel: {config.slack_channel_name}.\n"
             f"Weekly schedule: poll {config.schedule['poll_create'].day} "
@@ -255,6 +292,13 @@ def build_app(config: Config, conn, llm=None):
         return True
 
     def handle_create_poll(command: MentionCommand, event, say, client) -> None:
+        existing_poll = db.get_open_poll(conn, config.slack_channel_id)
+        if existing_poll is not None:
+            say(
+                "There is already an open lunch poll, so I left it and its votes unchanged. "
+                "Add choices with `@lunch-bot add <restaurant or cuisine> to the open poll`."
+            )
+            return
         if command.count is not None:
             count = command.count
         elif len(command.queries) >= 2:
@@ -269,10 +313,25 @@ def build_app(config: Config, conn, llm=None):
 
         required_ids: list[int] = []
         unresolved: list[str] = []
-        for query in command.queries:
-            restaurant = choose_from_pool(query, excluding=set(required_ids))
+        entities = [(query, False) for query in command.queries]
+        entities.extend((query, True) for query in command.cuisines)
+        for query, is_cuisine in entities:
+            restaurant, ambiguous = choose_from_pool(
+                query, excluding=set(required_ids), cuisine=is_cuisine
+            )
+            if ambiguous:
+                unresolved.append(
+                    f"'{query}' matches multiple restaurants: {', '.join(ambiguous)}. "
+                    "Please use the full name."
+                )
+                continue
             if restaurant is not None and restaurant.id is not None:
                 required_ids.append(restaurant.id)
+                continue
+            if is_cuisine:
+                unresolved.append(
+                    f"There are no available {query} restaurants in the candidate list."
+                )
                 continue
             requested, error = request_restaurant_confirmation(
                 query, event, client, target="pool"
@@ -312,9 +371,26 @@ def build_app(config: Config, conn, llm=None):
         existing_ids = set(db.get_poll_option_ids(conn, poll["id"]))
         added_ids: list[int] = []
         failures: list[str] = []
-        for query in command.queries:
-            restaurant = choose_from_pool(query, excluding=existing_ids | set(added_ids))
+        entities = [(query, False) for query in command.queries]
+        entities.extend((query, True) for query in command.cuisines)
+        for query, is_cuisine in entities:
+            restaurant, ambiguous = choose_from_pool(
+                query,
+                excluding=existing_ids | set(added_ids),
+                cuisine=is_cuisine,
+            )
+            if ambiguous:
+                failures.append(
+                    f"'{query}' matches multiple restaurants: {', '.join(ambiguous)}. "
+                    "Please use the full name."
+                )
+                continue
             if restaurant is None:
+                if is_cuisine:
+                    failures.append(
+                        f"There are no available {query} restaurants in the candidate list."
+                    )
+                    continue
                 requested, error = request_restaurant_confirmation(
                     query, event, client, target="poll", poll_id=poll["id"]
                 )
@@ -335,11 +411,16 @@ def build_app(config: Config, conn, llm=None):
             return
 
         try:
-            update_poll_message(poll["id"], client)
+            updated = update_poll_message(poll["id"], client)
         except Exception as exc:  # pragma: no cover - Slack network best-effort
             for restaurant_id in added_ids:
                 db.remove_poll_option(conn, poll["id"], restaurant_id)
             say(f"I couldn't update the Slack poll, so I rolled back the new choices: {exc}")
+            return
+        if not updated:
+            for restaurant_id in added_ids:
+                db.remove_poll_option(conn, poll["id"], restaurant_id)
+            say("The poll changed while I was updating it, so I rolled back the new choices.")
             return
 
         db.increment_selection_counts(conn, added_ids)
@@ -353,7 +434,25 @@ def build_app(config: Config, conn, llm=None):
     def handle_app_mention(event, say, client):
         """Handle conversational poll management and restaurant requests."""
         text = _strip_mentions(event.get("text", ""))
-        command = parse_mention_command(text)
+        if llm is not None:
+            try:
+                command = llm.route_message(text, conversation_context())
+            except Exception:  # pragma: no cover - provider/network best-effort
+                say(
+                    "I couldn't safely understand that request, so I did not change anything. "
+                    "Please try again or mention me with `help`."
+                )
+                return
+        else:
+            # Keep useful read-only behaviour when the model is unavailable, but
+            # never authorize a mutation through the legacy regex parser.
+            command = parse_mention_command(text)
+            if command.kind in MUTATING_COMMAND_KINDS:
+                say(
+                    "Language routing is unavailable, so I did not change anything. "
+                    "Please try again when the LLM service is enabled."
+                )
+                return
 
         if command.kind in {"create_poll", "add_to_poll"} and event.get("channel") != config.slack_channel_id:
             say(f"Polls can only be managed in {config.slack_channel_name}.")
@@ -379,7 +478,14 @@ def build_app(config: Config, conn, llm=None):
             say(current_poll_text())
             return
         if command.kind == "restaurant_location":
-            restaurant = choose_from_pool(command.queries[0])
+            restaurant, ambiguous = choose_from_pool(command.queries[0])
+            if ambiguous:
+                say(
+                    f"'{command.queries[0]}' matches multiple restaurants: "
+                    + ", ".join(ambiguous)
+                    + ". Please ask using the full name."
+                )
+                return
             if restaurant is None:
                 say(f"I couldn't find '{command.queries[0]}' in the candidate list.")
                 return
@@ -414,11 +520,21 @@ def build_app(config: Config, conn, llm=None):
             )
             return
 
+        if command.kind == "clarify":
+            say(command.clarification or "Could you clarify what you want me to do?")
+            return
+
         already_available: list[str] = []
         pending: list[str] = []
         failures: list[str] = []
         for query in command.queries:
-            existing = choose_from_pool(query)
+            existing, ambiguous = choose_from_pool(query)
+            if ambiguous:
+                failures.append(
+                    f"'{query}' matches multiple restaurants: {', '.join(ambiguous)}. "
+                    "Please use the full name."
+                )
+                continue
             if existing is not None:
                 already_available.append(existing.name)
                 continue

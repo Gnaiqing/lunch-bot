@@ -54,13 +54,18 @@ Commands are conversational and accept either `poll` or `polly`:
 @lunch-bot where is Miznon? Can you provide its Google Maps link?
 ```
 
-Creating a poll replaces any stale open poll. Adding a named restaurant first
-uses the existing candidate pool; if it is not present, the bot validates it
+Conversational poll creation refuses to replace an already-open poll, preserving
+its choices and votes. The weekly scheduler still reconciles stale polls before
+posting a new week's poll. Adding a named restaurant first uses the existing
+candidate pool; if it is not present, the bot validates it
 through Google Places and adds it. A cuisine request such as “pizza restaurant”
 selects a matching candidate that is not already in the poll.
 
-Messages that do not match an explicit command use read-only conversational QA
-and never mutate the database. Restaurant suggestions must be explicit, such as
+An LLM classifies conversational requests into a strict command schema. Trusted
+application code validates that schema and performs all channel checks,
+confirmations, and database writes. Negated, hypothetical, ambiguous, malformed,
+or unavailable model responses never mutate the database. Restaurant suggestions
+must be explicit, such as
 `add Pai Northern Thai to the candidate list` or
 `restaurant suggestion: Pai Northern Thai`. Suggested places must be food-related,
 within the configured search radius, and within the configured price level. The
@@ -76,7 +81,7 @@ to enrich older rows that predate these fields.
 ```
 Slack (Socket Mode)  ─┐
                       ├─ slack_app.py   conversational commands + poll button votes
-                      ├─ commands.py    deterministic mention intent parsing
+                      ├─ commands.py    typed command schema + route validation
 APScheduler  ─────────┤
                       ├─ scheduler.py   poll_create · poll_close+announce · order_reminder
                       │
@@ -84,7 +89,7 @@ APScheduler  ─────────┤
                       ├─ selection.py   diversity + vote-weighted UCB sampling  (PURE, unit-tested)
                       ├─ polls.py       Block Kit poll build + vote handling + tally
                       ├─ ubereats.py    order summary + Uber Eats link (NO automation)
-                      ├─ llm.py         Anthropic (Claude) or OpenAI (GPT) cuisine tag + suggestion parse
+                      ├─ llm.py         semantic routing + cuisine/suggestion language tasks
                       ├─ db.py          SQLite schema + query helpers (stdlib sqlite3)
                       ├─ models.py      Restaurant / Poll / Vote dataclasses
                       └─ config.py      env + config.yaml -> Config dataclass
@@ -98,7 +103,8 @@ APScheduler  ─────────┤
 - **Discovery:** Google Places Nearby Search + Geocoding (`googlemaps`).
 - **LLM:** pluggable provider (`llm_provider`) — Anthropic `anthropic` SDK
   (`claude-haiku-4-5`, default) or OpenAI `openai` SDK (`gpt-4o-mini`), both
-  fast/cheap, for cuisine tagging and parsing free-text restaurant suggestions.
+  fast/cheap, for semantic routing, cuisine tagging, conversational QA, and
+  parsing free-text restaurant suggestions.
   Only the selected provider's API key is needed.
 - **Deploy:** a lab compute cluster via **SkyPilot** (`sky.yaml`).
 
@@ -193,7 +199,9 @@ App-level token scope summary: `connections:write` (Socket Mode) + bot scopes
 ### 3. LLM provider key (Anthropic or OpenAI)
 
 Pick a provider with `LLM_PROVIDER` (`anthropic` or `openai`, default `anthropic`).
-Only the selected provider's key is required; the LLM is optional overall.
+Only the selected provider's key is required. The process can run without an
+LLM, but state-changing conversational commands fail closed until it is enabled;
+read-only help and list requests remain available.
 
 - **Anthropic:** get a key at <https://console.anthropic.com/> → `ANTHROPIC_API_KEY`.
   Model defaults to `claude-haiku-4-5` (fast/cheap), overridable via `ANTHROPIC_MODEL`.

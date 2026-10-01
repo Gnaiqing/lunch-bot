@@ -80,9 +80,9 @@ def main() -> None:
     conn = db.init_db(config.db_path)
     logger.info("Initialised database at %s", config.db_path)
 
-    # LLM is optional — the bot still runs without it (cuisine tagging + free-text
-    # suggestion parsing degrade gracefully). When enabled, only the ACTIVE
-    # provider's key is required.
+    # The process can run without an LLM, but state-changing conversational
+    # commands fail closed until language routing is available. Read-only help
+    # and list commands still work. Only the ACTIVE provider's key is required.
     llm = None
     if active_llm_api_key(config):
         try:
@@ -95,7 +95,7 @@ def main() -> None:
     else:
         logger.info(
             "LLM disabled: no API key for provider %r — set %s to enable "
-            "cuisine tagging + suggestion parsing.",
+            "semantic command routing, cuisine tagging, and suggestion parsing.",
             config.llm_provider, missing_llm_key_env(config),
         )
 

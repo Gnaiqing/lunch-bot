@@ -1,6 +1,10 @@
-"""Tests for deterministic conversational Slack command parsing."""
+"""Tests for conversational Slack command parsing and route validation."""
 
-from lunch_bot.commands import match_restaurants, parse_mention_command
+import json
+
+import pytest
+
+from lunch_bot.commands import match_restaurants, parse_mention_command, parse_semantic_route
 from lunch_bot.models import Restaurant
 
 
@@ -22,6 +26,18 @@ def test_add_cuisine_to_current_polly():
     command = parse_mention_command("can we add a pizza restaurant in this week's polly?")
     assert command.kind == "add_to_poll"
     assert command.queries == ["pizza"]
+
+
+def test_add_to_poll_handles_curly_apostrophe_and_open_poll_wording():
+    command = parse_mention_command(
+        "Can you add a pizza restaurant to this week’s polly?"
+    )
+    assert command.kind == "add_to_poll"
+    assert command.queries == ["pizza"]
+
+    command = parse_mention_command("add Pizza Rustica to the open poll")
+    assert command.kind == "add_to_poll"
+    assert command.queries == ["Pizza Rustica"]
 
 
 def test_list_current_restaurants():
@@ -75,3 +91,71 @@ def test_match_restaurant_name_before_cuisine():
     assert [r.id for r in match_restaurants(pool, "Pala 148")] == [1]
     assert {r.id for r in match_restaurants(pool, "pizza")} == {1, 2}
     assert match_restaurants(pool, "Pizza Pizza") == []
+
+
+def _route(**overrides):
+    value = {
+        "intent": "conversation",
+        "mode": "answer",
+        "restaurant_names": [],
+        "cuisines": [],
+        "count": None,
+        "negated": False,
+        "hypothetical": False,
+        "ambiguous": False,
+        "clarification": None,
+    }
+    value.update(overrides)
+    return json.dumps(value)
+
+
+def test_semantic_route_preserves_full_name_and_cuisine_types():
+    named = parse_semantic_route(
+        _route(
+            intent="add_to_poll",
+            mode="execute",
+            restaurant_names=["Za Cafe Pizzeria and Bar"],
+        )
+    )
+    assert named.queries == ["Za Cafe Pizzeria and Bar"]
+    assert named.cuisines == []
+
+    cuisine = parse_semantic_route(
+        _route(intent="add_to_poll", mode="execute", cuisines=["pizza"])
+    )
+    assert cuisine.queries == []
+    assert cuisine.cuisines == ["pizza"]
+
+
+@pytest.mark.parametrize("flag", ["negated", "hypothetical"])
+def test_semantic_route_never_executes_negated_or_hypothetical_action(flag):
+    command = parse_semantic_route(
+        _route(
+            intent="add_to_poll",
+            mode="execute",
+            restaurant_names=["Miznon"],
+            **{flag: True},
+        )
+    )
+    assert command.kind == "conversation"
+
+
+def test_semantic_route_turns_ambiguous_mutation_into_clarification():
+    command = parse_semantic_route(
+        _route(
+            intent="add_to_poll",
+            mode="execute",
+            restaurant_names=["Cafe"],
+            ambiguous=True,
+            clarification="Which cafe do you mean?",
+        )
+    )
+    assert command.kind == "clarify"
+    assert command.clarification == "Which cafe do you mean?"
+
+
+def test_semantic_route_rejects_malformed_or_incomplete_output():
+    with pytest.raises(ValueError):
+        parse_semantic_route("not json")
+    with pytest.raises(ValueError):
+        parse_semantic_route('{"intent": "create_poll"}')

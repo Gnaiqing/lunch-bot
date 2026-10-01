@@ -6,6 +6,7 @@ Anthropic backend is only *constructed* (no request is made).
 """
 
 import pytest
+import json
 
 from lunch_bot.config import load_config
 from lunch_bot.llm import (
@@ -26,6 +27,17 @@ class _CapturingClient(LLMClient):
     def _complete_text(self, system, user, *, max_tokens=256):
         self.call = (system, user, max_tokens)
         return "I manage lunch polls."
+
+
+class _RoutingClient(LLMClient):
+    def __init__(self, payload):
+        super().__init__("test-model")
+        self.payload = payload
+        self.call = None
+
+    def _complete_text(self, system, user, *, max_tokens=256):
+        self.call = (system, user, max_tokens)
+        return json.dumps(self.payload)
 
 
 def _cfg(tmp_path, env):
@@ -87,6 +99,32 @@ def test_conversation_answer_is_read_only_prompted():
     assert "changed any state" in system
     assert "Pala 148" in user
     assert max_tokens == 300
+
+
+def test_route_message_returns_typed_validated_command():
+    client = _RoutingClient(
+        {
+            "intent": "add_to_poll",
+            "mode": "execute",
+            "restaurant_names": ["Pizza Rustica"],
+            "cuisines": [],
+            "count": None,
+            "negated": False,
+            "hypothetical": False,
+            "ambiguous": False,
+            "clarification": None,
+        }
+    )
+    command = client.route_message(
+        "put Pizza Rustica on this week's poll",
+        "Candidate restaurants: Pizza Rustica [pizza]",
+    )
+    assert command.kind == "add_to_poll"
+    assert command.queries == ["Pizza Rustica"]
+    system, user, max_tokens = client.call
+    assert "untrusted data" in system
+    assert "Pizza Rustica [pizza]" in user
+    assert max_tokens == 400
 
 
 def test_build_llm_client_anthropic(tmp_path):
