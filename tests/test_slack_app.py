@@ -427,6 +427,58 @@ def test_new_poll_choice_waits_for_confirmation_before_database_and_poll(monkeyp
     assert db.get_pending_restaurant_confirmation(conn, token)["status"] == "confirmed"
 
 
+def test_inactive_restaurant_cannot_be_confirmed_into_poll(monkeypatch, tmp_path):
+    monkeypatch.setattr("slack_bolt.App", _FakeBoltApp)
+    monkeypatch.setattr(
+        "lunch_bot.discovery.validate_suggestion",
+        lambda _config, _name, _location=None: Restaurant(
+            name="Removed Lunch Spot", place_id="removed-lunch-place"
+        ),
+    )
+    config = load_config(
+        env={"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_CHANNEL_ID": "C_TEST"},
+        load_dotenv=False,
+        config_path="__none__.yaml",
+    )
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    removed_id = db.upsert_restaurant(
+        conn, Restaurant(name="Removed Lunch Spot", place_id="removed-lunch-place")
+    )
+    db.set_restaurants_active(conn, [removed_id], active=False)
+    existing_id = db.upsert_restaurant(conn, Restaurant(name="Existing"))
+    poll_id = db.create_poll(conn, "C_TEST", [existing_id])
+    db.set_poll_ts(conn, poll_id, "1700000000.000010")
+    app = build_app(config, conn, llm=_RoutingLLM())
+    client = _FakeSlackClient()
+
+    app.events["app_mention"](
+        event={
+            "channel": "C_TEST",
+            "user": "U_REQUESTER",
+            "text": "<@U_BOT> add Removed Lunch Spot to this week's poll",
+        },
+        say=lambda _message: None,
+        client=client,
+    )
+    token = client.posts[0]["blocks"][2]["elements"][0]["value"]
+    actions = {pattern: handler for pattern, handler in app.actions if isinstance(pattern, str)}
+    actions["restaurant_confirm"](
+        ack=lambda: None,
+        body={
+            "actions": [{"value": token}],
+            "user": {"id": "U_REQUESTER"},
+            "channel": {"id": "C_TEST"},
+            "container": {"message_ts": "1700000000.000020"},
+        },
+        client=client,
+    )
+
+    assert db.get_restaurant(conn, removed_id).active is False
+    assert removed_id not in db.get_poll_option_ids(conn, poll_id)
+    assert db.get_pending_restaurant_confirmation(conn, token)["status"] == "failed"
+    assert "Ask a manager to restore it" in client.ephemeral[0]["text"]
+
+
 def test_confirmed_choice_rolls_back_if_poll_message_becomes_unavailable(
     monkeypatch, tmp_path
 ):

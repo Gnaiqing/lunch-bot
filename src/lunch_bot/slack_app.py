@@ -1373,6 +1373,15 @@ def build_app(config: Config, conn, llm=None):
                 except Exception:  # pragma: no cover - provider best-effort
                     pass
             restaurant.id = db.upsert_restaurant(conn, restaurant)
+            if not db.get_restaurant(conn, restaurant.id).active:
+                db.resolve_pending_restaurant_confirmation(conn, token, "failed")
+                action_error(
+                    client,
+                    body,
+                    "This restaurant was removed from the candidate list. "
+                    "Ask a manager to restore it before adding it.",
+                )
+                return
             poll_added = False
             if claimed["target"] == "poll" and claimed["poll_id"] is not None:
                 added_ids, _rejected_ids, poll_added = add_poll_options_and_update(
