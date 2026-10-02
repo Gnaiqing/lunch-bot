@@ -5,9 +5,11 @@ Network-free: the Slack client is a stub and the DB is a throwaway sqlite file
 
 - H2: if the Slack post fails, ``create_weekly_poll`` leaves no open poll behind
   and does NOT consume the selection (``times_selected`` stays put).
-- H3: with a pre-existing open poll, ``create_weekly_poll`` reconciles it so at
-  most one poll is open, and the normal path still works when none is open.
+- H3: with a pre-existing open poll, ``create_weekly_poll`` preserves it and the
+  database invariant prevents a competing replacement from being posted.
 """
+
+import threading
 
 from lunch_bot import db, scheduler
 from lunch_bot.config import load_config
@@ -55,6 +57,23 @@ class _FailingClient:
     def chat_postMessage(self, **kwargs):
         self.calls += 1
         raise RuntimeError("slack is down")
+
+
+class _BlockingCreateClient(_OkClient):
+    def __init__(self):
+        super().__init__()
+        self.post_started = threading.Event()
+        self.release_post = threading.Event()
+        self.updates = []
+
+    def chat_postMessage(self, **kwargs):
+        if kwargs["text"] == "This week's lunch poll is up!":
+            self.post_started.set()
+            assert self.release_post.wait(timeout=5)
+        return super().chat_postMessage(**kwargs)
+
+    def chat_update(self, **kwargs):
+        self.updates.append(kwargs)
 
 
 def _open_polls(conn, channel="C_TEST"):
@@ -119,10 +138,54 @@ def test_successful_post_opens_one_poll_and_consumes_selection(tmp_path):
         assert count == expected
 
 
+def test_poll_cannot_be_closed_before_creation_post_and_timestamp_finish(tmp_path):
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    _seed(conn)
+    config = _config()
+    client = _BlockingCreateClient()
+    created_ids = []
+    create_thread = threading.Thread(
+        target=lambda: created_ids.append(
+            scheduler.create_weekly_poll(config, conn, client)
+        )
+    )
+    create_thread.start()
+    assert client.post_started.wait(timeout=5)
+
+    close_started = threading.Event()
+    close_finished = threading.Event()
+
+    def close_poll():
+        close_started.set()
+        scheduler.close_poll_and_announce(config, conn, client)
+        close_finished.set()
+
+    close_thread = threading.Thread(target=close_poll)
+    close_thread.start()
+    assert close_started.wait(timeout=5)
+    assert not close_finished.wait(timeout=0.1)
+    client.release_post.set()
+    create_thread.join(timeout=5)
+    close_thread.join(timeout=5)
+
+    assert not create_thread.is_alive()
+    assert not close_thread.is_alive()
+    poll_id = created_ids[0]
+    poll = db.get_poll(conn, poll_id)
+    assert poll["status"] == "closed"
+    assert poll["slack_ts"] is not None
+    assert client.updates[-1]["text"] == "Lunch poll closed"
+    assert all(
+        "accessory" not in block
+        for block in client.updates[-1]["blocks"]
+        if block["type"] == "section"
+    )
+
+
 # ---------------------------------------------------------------------------
-# H3 — a pre-existing open poll is reconciled so at most one poll stays open.
+# H3 — a pre-existing open poll wins; a competing request changes nothing.
 # ---------------------------------------------------------------------------
-def test_preexisting_open_poll_is_reconciled(tmp_path):
+def test_preexisting_open_poll_is_preserved(tmp_path):
     conn = db.init_db(str(tmp_path / "lunch.db"))
     ids = _seed(conn)
 
@@ -134,42 +197,83 @@ def test_preexisting_open_poll_is_reconciled(tmp_path):
     client = _OkClient()
     new_id = scheduler.create_weekly_poll(config, conn, client)
 
-    assert new_id is not None and new_id != stale_id
-    # At most one open poll — the new one; the stale poll is now closed.
+    assert new_id is None
     open_polls = _open_polls(conn)
     assert len(open_polls) == 1
-    assert open_polls[0]["id"] == new_id
-    assert db.get_poll(conn, stale_id)["status"] == "closed"
-    # Reconciliation posts no winner announcement: only the new poll was posted.
-    assert client.calls == 1
+    assert open_polls[0]["id"] == stale_id
+    assert db.get_poll(conn, stale_id)["status"] == "open"
+    assert client.calls == 0
 
 
 # ---------------------------------------------------------------------------
-# H3 (multiple) — MANY pre-existing open polls are ALL reconciled, not just the
-# newest, so the at-most-one-open-poll invariant holds after creation.
+# H3 (database) — the partial unique index rejects a second open poll.
 # ---------------------------------------------------------------------------
-def test_multiple_preexisting_open_polls_are_all_reconciled(tmp_path):
+def test_database_rejects_second_open_poll_for_channel(tmp_path):
     conn = db.init_db(str(tmp_path / "lunch.db"))
     ids = _seed(conn)
+    first_id = db.create_poll(conn, "C_TEST", ids[:3])
 
-    # Simulate several stale open polls that leaked (legacy state / manual DB
-    # recovery) — more than get_open_poll() (newest-only) would ever revisit.
-    stale_ids = [
-        db.create_poll(conn, "C_TEST", ids[:3], closes_at="2000-01-01T00:00:00+00:00")
-        for _ in range(3)
-    ]
-    assert len(_open_polls(conn)) == 3
+    try:
+        db.create_poll(conn, "C_TEST", ids[1:])
+    except db.PollAlreadyOpenError:
+        pass
+    else:  # pragma: no cover - makes the expected constraint explicit
+        raise AssertionError("a second open poll was accepted")
 
+    assert [poll["id"] for poll in _open_polls(conn)] == [first_id]
+
+
+def test_manual_poll_size_and_required_choice(tmp_path):
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    ids = _seed(conn, n=6)
     config = _config()
     client = _OkClient()
-    new_id = scheduler.create_weekly_poll(config, conn, client)
 
-    assert new_id is not None and new_id not in stale_ids
-    # Exactly one open poll remains — the new one; every prior poll is closed.
-    open_polls = _open_polls(conn)
-    assert len(open_polls) == 1
-    assert open_polls[0]["id"] == new_id
-    for stale_id in stale_ids:
-        assert db.get_poll(conn, stale_id)["status"] == "closed"
-    # No winner announcement posted for any reconciled poll: only the new poll.
-    assert client.calls == 1
+    poll_id = scheduler.create_weekly_poll(
+        config,
+        conn,
+        client,
+        poll_size=4,
+        required_restaurant_ids=[ids[-1]],
+    )
+
+    option_ids = db.get_poll_option_ids(conn, poll_id)
+    assert len(option_ids) == 4
+    assert ids[-1] in option_ids
+
+
+def test_poll_creation_never_discovers_or_reactivates_removed_candidates(
+    monkeypatch, tmp_path
+):
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    active_ids = _seed(conn, n=4)
+    removed_id = db.upsert_restaurant(
+        conn,
+        Restaurant(
+            name="InterContinental Toronto Centre by IHG",
+            cuisine="other",
+            place_id="hotel-place",
+            active=False,
+        ),
+    )
+    config = load_config(
+        env={
+            "SLACK_CHANNEL_ID": "C_TEST",
+            "GOOGLE_MAPS_API_KEY": "configured-but-must-not-be-used",
+            "POLL_SIZE": "4",
+        },
+        load_dotenv=False,
+        config_path="__none__.yaml",
+    )
+    monkeypatch.setattr(
+        "lunch_bot.discovery.discover_and_store",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("poll creation must not run discovery")
+        ),
+    )
+
+    poll_id = scheduler.create_weekly_poll(config, conn, _OkClient())
+
+    assert set(db.get_poll_option_ids(conn, poll_id)) == set(active_ids)
+    assert removed_id not in db.get_poll_option_ids(conn, poll_id)
+    assert db.get_restaurant(conn, removed_id).active is False

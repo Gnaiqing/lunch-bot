@@ -12,6 +12,7 @@ cover the Copilot review fixes:
 """
 
 import threading
+import sqlite3
 
 from lunch_bot import db, polls
 from lunch_bot.models import Restaurant
@@ -63,6 +64,70 @@ def test_upsert_does_not_match_already_validated_rows(tmp_path):
     assert conn.execute("SELECT COUNT(*) AS c FROM restaurants").fetchone()["c"] == 2
 
 
+def test_soft_remove_and_reactivate_restaurant_preserves_row(tmp_path):
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    restaurant_id = db.upsert_restaurant(
+        conn, Restaurant(name="Not Actually a Restaurant", cuisine="other")
+    )
+
+    assert db.set_restaurants_active(conn, [restaurant_id], active=False) == 1
+    assert db.get_active_restaurants(conn) == []
+    assert db.get_restaurant(conn, restaurant_id).active is False
+
+    assert db.set_restaurants_active(conn, [restaurant_id], active=True) == 1
+    assert [restaurant.id for restaurant in db.get_active_restaurants(conn)] == [
+        restaurant_id
+    ]
+
+
+def test_upsert_does_not_reactivate_soft_removed_restaurant(tmp_path):
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    restaurant_id = db.upsert_restaurant(
+        conn, Restaurant(name="Removed Candidate", place_id="removed-place")
+    )
+    db.set_restaurants_active(conn, [restaurant_id], active=False)
+
+    matched_id = db.upsert_restaurant(
+        conn,
+        Restaurant(
+            name="Removed Candidate",
+            place_id="removed-place",
+            address="Updated address",
+        ),
+    )
+
+    assert matched_id == restaurant_id
+    assert db.get_restaurant(conn, restaurant_id).active is False
+    assert db.get_restaurant(conn, restaurant_id).address == "Updated address"
+
+
+def test_merge_restaurants_preserves_poll_votes_and_history(tmp_path):
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    source = db.upsert_restaurant(conn, Restaurant(name="Raku duplicate"))
+    destination = db.upsert_restaurant(conn, Restaurant(name="Raku"))
+    poll_id = db.create_poll(conn, "C1", [source, destination])
+    db.record_vote_if_open(conn, poll_id, source, "U1")
+    db.record_vote_if_open(conn, poll_id, destination, "U1")
+    db.record_vote_if_open(conn, poll_id, source, "U2")
+
+    db.merge_restaurants(conn, source, destination)
+
+    assert db.get_poll_option_ids(conn, poll_id) == [destination]
+    assert db.tally_votes(conn, poll_id) == {destination: 2}
+    assert db.get_restaurant(conn, source).active is False
+
+
+def test_cancel_poll_does_not_fold_vote_totals(tmp_path):
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    poll_id, restaurant_id, _ = _two_option_poll(conn)
+    db.record_vote_if_open(conn, poll_id, restaurant_id, "U1")
+
+    assert db.cancel_poll_if_open(conn, poll_id) is True
+    assert db.get_poll(conn, poll_id)["status"] == "cancelled"
+    assert db.get_restaurant(conn, restaurant_id).total_votes == 0
+    assert db.cancel_poll_if_open(conn, poll_id) is False
+
+
 # ---------------------------------------------------------------------------
 # F3 — vote guarding.
 # ---------------------------------------------------------------------------
@@ -105,6 +170,139 @@ def test_handle_vote_rejects_invalid_option(tmp_path):
 def test_handle_vote_ignores_non_vote_action(tmp_path):
     conn = db.init_db(str(tmp_path / "lunch.db"))
     assert polls.handle_vote(conn, "not-a-vote-action", "U1") is None
+
+
+def test_one_user_can_vote_for_multiple_options_and_toggle_one_off(tmp_path):
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    poll_id, r1, r2 = _two_option_poll(conn)
+
+    assert polls.handle_vote(conn, polls.vote_action_id(poll_id, r1), "U1") == (poll_id, r1)
+    assert polls.handle_vote(conn, polls.vote_action_id(poll_id, r2), "U1") == (poll_id, r2)
+    assert db.tally_votes(conn, poll_id) == {r1: 1, r2: 1}
+
+    # Clicking the first option again removes only that selection.
+    assert polls.handle_vote(conn, polls.vote_action_id(poll_id, r1), "U1") == (poll_id, r1)
+    assert db.tally_votes(conn, poll_id) == {r2: 1}
+
+
+def test_poll_voters_are_grouped_by_option(tmp_path):
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    poll_id, r1, r2 = _two_option_poll(conn)
+    db.record_vote_if_open(conn, poll_id, r1, "U1")
+    db.record_vote_if_open(conn, poll_id, r1, "U2")
+    db.record_vote_if_open(conn, poll_id, r2, "U2")
+
+    assert db.get_poll_voters(conn, poll_id) == {
+        r1: ["U1", "U2"],
+        r2: ["U2"],
+    }
+
+
+def test_init_db_migrates_legacy_single_choice_votes(tmp_path):
+    path = str(tmp_path / "legacy.db")
+    conn = sqlite3.connect(path)
+    legacy_schema = db.SCHEMA.replace(
+        "UNIQUE (poll_id, restaurant_id, slack_user_id)",
+        "UNIQUE (poll_id, slack_user_id)",
+    )
+    conn.executescript(legacy_schema)
+    conn.execute(
+        "INSERT INTO restaurants (name, source, active, times_selected, total_votes, created_at) "
+        "VALUES ('A', 'seed', 1, 0, 0, 'now')"
+    )
+    conn.execute(
+        "INSERT INTO restaurants (name, source, active, times_selected, total_votes, created_at) "
+        "VALUES ('B', 'seed', 1, 0, 0, 'now')"
+    )
+    conn.execute(
+        "INSERT INTO polls (slack_channel, created_at, status) VALUES ('C1', 'now', 'open')"
+    )
+    conn.execute("INSERT INTO poll_options (poll_id, restaurant_id) VALUES (1, 1)")
+    conn.execute("INSERT INTO poll_options (poll_id, restaurant_id) VALUES (1, 2)")
+    conn.execute(
+        "INSERT INTO votes (poll_id, restaurant_id, slack_user_id, created_at) "
+        "VALUES (1, 1, 'U1', 'now')"
+    )
+    conn.commit()
+    conn.close()
+
+    migrated = db.init_db(path)
+    # Existing vote survives, and the same user can now select another option.
+    assert db.tally_votes(migrated, 1) == {1: 1}
+    assert db.record_vote_if_open(migrated, 1, 2, "U1") is True
+    assert db.tally_votes(migrated, 1) == {1: 1, 2: 1}
+    indexes = {
+        row[1] for row in migrated.execute("PRAGMA index_list(votes)").fetchall()
+    }
+    assert "idx_votes_poll" in indexes
+
+
+def test_init_db_adds_maps_url_to_legacy_tables(tmp_path):
+    path = str(tmp_path / "legacy-location.db")
+    conn = sqlite3.connect(path)
+    legacy_schema = db.SCHEMA.replace("    maps_url         TEXT,\n", "").replace(
+        "    maps_url       TEXT,\n", ""
+    )
+    conn.executescript(legacy_schema)
+    conn.close()
+
+    migrated = db.init_db(path)
+    restaurant_columns = {
+        row["name"] for row in migrated.execute("PRAGMA table_info('restaurants')")
+    }
+    pending_columns = {
+        row["name"]
+        for row in migrated.execute(
+            "PRAGMA table_info('pending_restaurant_confirmations')"
+        )
+    }
+    assert "maps_url" in restaurant_columns
+    assert "maps_url" in pending_columns
+
+
+def test_init_db_reconciles_legacy_duplicate_open_polls(tmp_path):
+    path = str(tmp_path / "legacy-open-polls.db")
+    conn = sqlite3.connect(path)
+    conn.executescript(db.SCHEMA)
+    conn.execute(
+        "INSERT INTO polls (slack_channel, created_at, status) VALUES ('C1', 'first', 'open')"
+    )
+    conn.execute(
+        "INSERT INTO polls (slack_channel, created_at, status) VALUES ('C1', 'second', 'open')"
+    )
+    conn.commit()
+    conn.close()
+
+    migrated = db.init_db(path)
+
+    rows = migrated.execute(
+        "SELECT id, status FROM polls WHERE slack_channel = 'C1' ORDER BY id"
+    ).fetchall()
+    assert [(row["id"], row["status"]) for row in rows] == [
+        (1, "cancelled"),
+        (2, "open"),
+    ]
+    indexes = {
+        row["name"] for row in migrated.execute("PRAGMA index_list('polls')").fetchall()
+    }
+    assert "idx_polls_one_open_per_channel" in indexes
+
+
+def test_add_poll_option_enforces_maximum_inside_write(tmp_path):
+    conn = db.init_db(str(tmp_path / "max-options.db"))
+    restaurant_ids = [
+        db.upsert_restaurant(conn, Restaurant(name=f"Restaurant {index}"))
+        for index in range(3)
+    ]
+    poll_id = db.create_poll(conn, "C1", restaurant_ids[:2])
+
+    assert (
+        db.add_poll_option_if_open(
+            conn, poll_id, restaurant_ids[2], max_options=2
+        )
+        is False
+    )
+    assert db.get_poll_option_ids(conn, poll_id) == restaurant_ids[:2]
 
 
 # ---------------------------------------------------------------------------

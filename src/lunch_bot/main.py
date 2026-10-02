@@ -80,9 +80,9 @@ def main() -> None:
     conn = db.init_db(config.db_path)
     logger.info("Initialised database at %s", config.db_path)
 
-    # LLM is optional — the bot still runs without it (cuisine tagging + free-text
-    # suggestion parsing degrade gracefully). When enabled, only the ACTIVE
-    # provider's key is required.
+    # The process can run without an LLM, but state-changing conversational
+    # commands fail closed until language routing is available. Read-only help
+    # and list commands still work. Only the ACTIVE provider's key is required.
     llm = None
     if active_llm_api_key(config):
         try:
@@ -95,7 +95,7 @@ def main() -> None:
     else:
         logger.info(
             "LLM disabled: no API key for provider %r — set %s to enable "
-            "cuisine tagging + suggestion parsing.",
+            "semantic command routing, cuisine tagging, and suggestion parsing.",
             config.llm_provider, missing_llm_key_env(config),
         )
 
@@ -105,18 +105,27 @@ def main() -> None:
 
     app = build_app(config, conn, llm=llm)
 
-    scheduler = build_scheduler(config, conn, app.client, llm=llm)
-    scheduler.start()
-    sched = config.schedule
-    logger.info(
-        "Scheduler started (poll_create %s %s, poll_close %s %s, order_reminder %s %s; "
-        "order_deadline %s %s [human, no job]; tz=%s)",
-        sched["poll_create"].day, sched["poll_create"].time_str,
-        sched["poll_close"].day, sched["poll_close"].time_str,
-        sched["order_reminder"].day, sched["order_reminder"].time_str,
-        sched["order_deadline"].day, sched["order_deadline"].time_str,
-        config.timezone,
-    )
+    if config.scheduler_enabled:
+        scheduler = build_scheduler(config, conn, app.client, llm=llm)
+        scheduler.start()
+        sched = config.schedule
+        logger.info(
+            "Scheduler started (poll_create %s %s, poll_close %s %s, "
+            "order_reminder %s %s; order_deadline %s %s [human, no job]; tz=%s)",
+            sched["poll_create"].day,
+            sched["poll_create"].time_str,
+            sched["poll_close"].day,
+            sched["poll_close"].time_str,
+            sched["order_reminder"].day,
+            sched["order_reminder"].time_str,
+            sched["order_deadline"].day,
+            sched["order_deadline"].time_str,
+            config.timezone,
+        )
+    else:
+        logger.info(
+            "Automatic scheduler disabled; polls and reminders require explicit commands."
+        )
 
     handler = SocketModeHandler(app, config.slack_app_token)
     logger.info("Starting Slack Socket Mode handler…")
