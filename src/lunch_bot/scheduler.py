@@ -71,19 +71,6 @@ def create_weekly_poll(
     if not candidates:
         return None
 
-    # Reconcile EVERY pre-existing open poll before opening a new one, so there is
-    # never more than one open poll. A missed/failed close job leaves a stale poll,
-    # and multiple can accumulate (legacy state, a prior version, or manual DB
-    # recovery); get_open_poll() only ever revisits the newest, so we must close
-    # them all here. Close + tally each in place WITHOUT announcing a winner — we
-    # don't want a surprise message — then log that it was reconciled.
-    for stale in db.get_open_polls(conn, config.slack_channel_id):
-        db.close_poll_and_tally(conn, stale["id"])
-        logger.warning(
-            "Reconciled stale open poll %s (closed without announcement) before creating a new poll.",
-            stale["id"],
-        )
-
     option_ids = [c.id for c in candidates if c.id is not None]
 
     # Poll closes on the configured poll_close day (Mon -> Wed by default).
@@ -91,13 +78,23 @@ def create_weekly_poll(
     # Create the poll row + options (needed to build the option action_ids) but do
     # NOT consume the selection yet: times_selected is incremented only once the
     # poll has actually been posted, so a failed Slack post leaves no trace.
-    poll_id = db.create_poll(
-        conn,
-        config.slack_channel_id,
-        option_ids,
-        closes_at=closes_at,
-        increment_selection=False,
-    )
+    try:
+        poll_id = db.create_poll(
+            conn,
+            config.slack_channel_id,
+            option_ids,
+            closes_at=closes_at,
+            increment_selection=False,
+        )
+    except db.PollAlreadyOpenError:
+        # The database constraint makes this check atomic with creation. In
+        # particular, a second Slack request must not close or post over the poll
+        # that won the race.
+        logger.warning(
+            "Skipped poll creation because channel %s already has an open poll.",
+            config.slack_channel_id,
+        )
+        return None
 
     blocks = polls.build_poll_blocks(poll_id, candidates)
     try:

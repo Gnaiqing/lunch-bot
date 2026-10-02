@@ -61,3 +61,17 @@ def test_food_place_outside_radius_is_rejected(monkeypatch):
     client = _PlacesClient([_place(types=["restaurant"], lat=44.0, lng=-79.39)])
     monkeypatch.setattr("lunch_bot.discovery._client", lambda _key: client)
     assert validate_suggestion(_config(), "Far Away Restaurant") is None
+
+
+def test_later_valid_place_is_used_when_first_result_is_invalid(monkeypatch):
+    invalid = _place(types=["lodging", "point_of_interest"])
+    valid = _place(types=["restaurant", "food"])
+    valid.update(name="Actual Restaurant", place_id="restaurant-2")
+    client = _PlacesClient([invalid, valid])
+    monkeypatch.setattr("lunch_bot.discovery._client", lambda _key: client)
+
+    restaurant = validate_suggestion(_config(), "Ambiguous Name")
+
+    assert restaurant is not None
+    assert restaurant.name == "Actual Restaurant"
+    assert restaurant.place_id == "restaurant-2"

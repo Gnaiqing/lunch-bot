@@ -402,7 +402,16 @@ def build_app(config: Config, conn, llm=None):
             required_restaurant_ids=required_ids,
         )
         if poll_id is None:
-            say("I couldn't create the poll. Check the bot logs and make sure the candidate list is not empty.")
+            if db.get_open_poll(conn, config.slack_channel_id) is not None:
+                say(
+                    "Another request created a poll first, so I left that poll and its "
+                    "choices unchanged."
+                )
+            else:
+                say(
+                    "I couldn't create the poll. Check the bot logs and make sure "
+                    "the candidate list is not empty."
+                )
 
     def handle_add_to_poll(command: MentionCommand, event, say, client) -> None:
         poll = db.get_open_poll(conn, config.slack_channel_id)
@@ -451,7 +460,12 @@ def build_app(config: Config, conn, llm=None):
                 else:
                     failures.append(error or f"Couldn't resolve '{query}'.")
                 continue
-            if db.add_poll_option_if_open(conn, poll["id"], restaurant.id):
+            if db.add_poll_option_if_open(
+                conn,
+                poll["id"],
+                restaurant.id,
+                max_options=config.max_poll_options,
+            ):
                 added_ids.append(restaurant.id)
             else:
                 failures.append(f"'{restaurant.name}' is already in the poll or the poll is closed.")
@@ -635,6 +649,30 @@ def build_app(config: Config, conn, llm=None):
         from .scheduler import close_poll_and_announce
 
         open_poll = db.get_open_poll(conn, config.slack_channel_id)
+
+        # A combined close-and-create command is destructive. Validate everything
+        # we can before closing the valid poll so a bad size or empty pool cannot
+        # leave the channel without any poll at all.
+        if create_new:
+            replacement_count = command.count or config.poll_size
+            unchanged = (
+                "I left the current poll open."
+                if open_poll is not None
+                else "No poll was changed."
+            )
+            if not 2 <= replacement_count <= config.max_poll_options:
+                say(
+                    f"Please request between 2 and {config.max_poll_options} poll choices. "
+                    + unchanged
+                )
+                return
+            if len(db.get_active_restaurants(conn)) < 2:
+                say(
+                    "I can't create a replacement because the candidate list needs at "
+                    f"least two active restaurants. {unchanged}"
+                )
+                return
+
         if open_poll is None and not create_new:
             say("There is no open poll to close.")
             return
@@ -838,22 +876,11 @@ def build_app(config: Config, conn, llm=None):
                 "• `@lunch-bot create a poll with 4 choices`\n"
                 "• `@lunch-bot create a poll with 4 choices including Pala 148`\n"
                 "• `@lunch-bot add a pizza restaurant to this week's poll`\n"
-                "• `@lunch-bot remove Miznon from the current poll` *(manager only)*\n"
-                "• `@lunch-bot remove all items in other from the candidate list` *(manager only)*\n"
-                "• `@lunch-bot close the current poll` *(manager only)*\n"
-                "• `@lunch-bot close the current poll and start a new poll with 4 choices` *(manager only)*\n"
-                "• `@lunch-bot cancel the current poll` *(manager only)*\n"
-                "• `@lunch-bot send the order reminder` *(manager only)*\n"
-                "• `@lunch-bot show removed restaurants` / `restore <name> to the candidate list` *(manager only)*\n"
-                "• `@lunch-bot rename <old name> to <new name>` *(manager only)*\n"
-                "• `@lunch-bot change <name>'s cuisine to <cuisine>` *(manager only)*\n"
-                "• `@lunch-bot merge <duplicate> into <restaurant to keep>` *(manager only)*\n"
-                "• `@lunch-bot refresh <name>'s Google Maps location` *(manager only)*\n"
                 "• `@lunch-bot show the current poll`\n"
+                "• `@lunch-bot where is Miznon?`\n"
                 "New Google Maps matches require your confirmation before they are added. "
-                "Everyone can add candidates and poll choices; only configured managers can "
-                "remove them or close a poll. Adding a restaurant to the poll also adds it to the candidate "
-                "list. Poll votes are multi-select; click a choice again to remove your vote."
+                "Adding a restaurant to the poll also adds it to the candidate list. "
+                "Poll votes are multi-select; click a choice again to remove your vote."
             )
             return
         if command.kind == "list_restaurants":
@@ -1110,12 +1137,25 @@ def build_app(config: Config, conn, llm=None):
                 message = f"Updated the stored Google Maps location for *{target.name}*."
                 channel, ts = action_message_location(body)
                 if channel and ts:
-                    client.chat_update(
-                        channel=channel,
-                        ts=ts,
-                        text=message,
-                        blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": message}}],
-                    )
+                    try:
+                        client.chat_update(
+                            channel=channel,
+                            ts=ts,
+                            text=message,
+                            blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": message}}],
+                        )
+                    except Exception:
+                        # The location update is already committed and the
+                        # confirmation is resolved. A Slack delivery problem must
+                        # not rewrite that durable state as failed.
+                        try:
+                            action_error(
+                                client,
+                                body,
+                                message + " I couldn't refresh the confirmation message.",
+                            )
+                        except Exception:  # pragma: no cover - Slack is unavailable
+                            pass
                 return
             if llm is not None and not restaurant.cuisine:
                 try:
@@ -1127,12 +1167,11 @@ def build_app(config: Config, conn, llm=None):
             restaurant.id = db.upsert_restaurant(conn, restaurant)
             poll_added = False
             if claimed["target"] == "poll" and claimed["poll_id"] is not None:
-                has_capacity = (
-                    len(db.get_poll_option_ids(conn, claimed["poll_id"]))
-                    < config.max_poll_options
-                )
-                poll_added = has_capacity and db.add_poll_option_if_open(
-                    conn, claimed["poll_id"], restaurant.id
+                poll_added = db.add_poll_option_if_open(
+                    conn,
+                    claimed["poll_id"],
+                    restaurant.id,
+                    max_options=config.max_poll_options,
                 )
                 if poll_added:
                     try:

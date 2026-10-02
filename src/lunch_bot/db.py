@@ -20,6 +20,10 @@ from .models import Restaurant
 # safe. Reads use SQLite's own per-statement locking.
 _write_lock = threading.Lock()
 
+
+class PollAlreadyOpenError(RuntimeError):
+    """Raised when a channel already has an open poll."""
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS restaurants (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -139,7 +143,44 @@ def init_db(db_path: str) -> sqlite3.Connection:
     _ensure_pending_confirmation_location_columns(conn)
     _ensure_pending_confirmation_target_column(conn)
     _migrate_votes_to_multi_select(conn)
+    _ensure_single_open_poll_per_channel(conn)
     return conn
+
+
+def _ensure_single_open_poll_per_channel(conn: sqlite3.Connection) -> None:
+    """Migrate legacy duplicates and enforce one open poll per channel.
+
+    Older versions could leak multiple open polls. Keep the newest one and mark
+    the others cancelled before installing the partial unique index. The index
+    protects the invariant across threads and even across multiple bot processes.
+    """
+    with _write_lock:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE polls
+                   SET status = 'cancelled'
+                 WHERE status = 'open'
+                   AND id NOT IN (
+                       SELECT MAX(id)
+                         FROM polls
+                        WHERE status = 'open'
+                        GROUP BY slack_channel
+                   )
+                """
+            )
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_polls_one_open_per_channel
+                    ON polls(slack_channel)
+                 WHERE status = 'open'
+                """
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def _ensure_restaurant_location_columns(conn: sqlite3.Connection) -> None:
@@ -619,22 +660,33 @@ def create_poll(
     now = _now_iso()
     option_ids = list(option_restaurant_ids)
     with _write_lock:
-        cur = conn.execute(
-            "INSERT INTO polls (slack_channel, created_at, closes_at, status) VALUES (?, ?, ?, 'open')",
-            (slack_channel, now, closes_at),
-        )
-        poll_id = int(cur.lastrowid)
-        for rid in option_ids:
-            conn.execute(
-                "INSERT INTO poll_options (poll_id, restaurant_id) VALUES (?, ?)",
-                (poll_id, rid),
+        try:
+            cur = conn.execute(
+                "INSERT INTO polls (slack_channel, created_at, closes_at, status) VALUES (?, ?, ?, 'open')",
+                (slack_channel, now, closes_at),
             )
-            if increment_selection:
+            poll_id = int(cur.lastrowid)
+            for rid in option_ids:
                 conn.execute(
-                    "UPDATE restaurants SET times_selected = times_selected + 1, last_selected_at = ? WHERE id = ?",
-                    (now, rid),
+                    "INSERT INTO poll_options (poll_id, restaurant_id) VALUES (?, ?)",
+                    (poll_id, rid),
                 )
-        conn.commit()
+                if increment_selection:
+                    conn.execute(
+                        "UPDATE restaurants SET times_selected = times_selected + 1, last_selected_at = ? WHERE id = ?",
+                        (now, rid),
+                    )
+            conn.commit()
+        except sqlite3.IntegrityError as exc:
+            conn.rollback()
+            if "polls.slack_channel" in str(exc):
+                raise PollAlreadyOpenError(
+                    f"Channel {slack_channel!r} already has an open poll."
+                ) from exc
+            raise
+        except Exception:
+            conn.rollback()
+            raise
     return poll_id
 
 
@@ -690,9 +742,13 @@ def get_poll_option_ids(conn: sqlite3.Connection, poll_id: int) -> list[int]:
 
 
 def add_poll_option_if_open(
-    conn: sqlite3.Connection, poll_id: int, restaurant_id: int
+    conn: sqlite3.Connection,
+    poll_id: int,
+    restaurant_id: int,
+    *,
+    max_options: int | None = None,
 ) -> bool:
-    """Add a restaurant to an open poll, returning whether it was newly added."""
+    """Atomically add an option when the poll is open, unique, and not full."""
     with _write_lock:
         poll = conn.execute(
             "SELECT status FROM polls WHERE id = ?", (poll_id,)
@@ -705,6 +761,13 @@ def add_poll_option_if_open(
         ).fetchone()
         if exists is not None:
             return False
+        if max_options is not None:
+            option_count = conn.execute(
+                "SELECT COUNT(*) AS count FROM poll_options WHERE poll_id = ?",
+                (poll_id,),
+            ).fetchone()["count"]
+            if option_count >= max_options:
+                return False
         conn.execute(
             "INSERT INTO poll_options (poll_id, restaurant_id) VALUES (?, ?)",
             (poll_id, restaurant_id),

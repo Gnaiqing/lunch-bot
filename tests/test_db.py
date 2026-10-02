@@ -235,6 +235,51 @@ def test_init_db_adds_maps_url_to_legacy_tables(tmp_path):
     assert "maps_url" in pending_columns
 
 
+def test_init_db_reconciles_legacy_duplicate_open_polls(tmp_path):
+    path = str(tmp_path / "legacy-open-polls.db")
+    conn = sqlite3.connect(path)
+    conn.executescript(db.SCHEMA)
+    conn.execute(
+        "INSERT INTO polls (slack_channel, created_at, status) VALUES ('C1', 'first', 'open')"
+    )
+    conn.execute(
+        "INSERT INTO polls (slack_channel, created_at, status) VALUES ('C1', 'second', 'open')"
+    )
+    conn.commit()
+    conn.close()
+
+    migrated = db.init_db(path)
+
+    rows = migrated.execute(
+        "SELECT id, status FROM polls WHERE slack_channel = 'C1' ORDER BY id"
+    ).fetchall()
+    assert [(row["id"], row["status"]) for row in rows] == [
+        (1, "cancelled"),
+        (2, "open"),
+    ]
+    indexes = {
+        row["name"] for row in migrated.execute("PRAGMA index_list('polls')").fetchall()
+    }
+    assert "idx_polls_one_open_per_channel" in indexes
+
+
+def test_add_poll_option_enforces_maximum_inside_write(tmp_path):
+    conn = db.init_db(str(tmp_path / "max-options.db"))
+    restaurant_ids = [
+        db.upsert_restaurant(conn, Restaurant(name=f"Restaurant {index}"))
+        for index in range(3)
+    ]
+    poll_id = db.create_poll(conn, "C1", restaurant_ids[:2])
+
+    assert (
+        db.add_poll_option_if_open(
+            conn, poll_id, restaurant_ids[2], max_options=2
+        )
+        is False
+    )
+    assert db.get_poll_option_ids(conn, poll_id) == restaurant_ids[:2]
+
+
 # ---------------------------------------------------------------------------
 # G2 — atomic check-and-insert vote guard (record_vote_if_open).
 # ---------------------------------------------------------------------------

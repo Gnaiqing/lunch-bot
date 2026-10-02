@@ -146,33 +146,39 @@ def lookup_restaurant(
         type="restaurant",
     )
     results = response.get("results", [])
-    if not results:
-        return None
-    place = results[0]
-    place_types = set(place.get("types", []))
-    if not place_types.intersection(FOOD_PLACE_TYPES):
-        return None
-    price_level = place.get("price_level")
-    if enforce_budget and price_level is not None and price_level > config.max_price_level:
-        return None
-    geometry = place.get("geometry", {}).get("location", {})
-    lat = geometry.get("lat")
-    lng = geometry.get("lng")
-    if lat is None or lng is None:
-        return None
-    if _distance_m(config.office_lat, config.office_lng, lat, lng) > config.search_radius_m:
-        return None
-    return Restaurant(
-        name=place.get("name", name),
-        cuisine=None,
-        address=place.get("formatted_address"),
-        place_id=place.get("place_id"),
-        lat=lat,
-        lng=lng,
-        maps_url=google_maps_url(place.get("name", name), place.get("place_id")),
-        price_level=price_level,
-        source="suggestion",
-    )
+    for place in results:
+        place_types = set(place.get("types", []))
+        if not place_types.intersection(FOOD_PLACE_TYPES):
+            continue
+        price_level = place.get("price_level")
+        if (
+            enforce_budget
+            and price_level is not None
+            and price_level > config.max_price_level
+        ):
+            continue
+        geometry = place.get("geometry", {}).get("location", {})
+        lat = geometry.get("lat")
+        lng = geometry.get("lng")
+        if lat is None or lng is None:
+            continue
+        if (
+            _distance_m(config.office_lat, config.office_lng, lat, lng)
+            > config.search_radius_m
+        ):
+            continue
+        return Restaurant(
+            name=place.get("name", name),
+            cuisine=None,
+            address=place.get("formatted_address"),
+            place_id=place.get("place_id"),
+            lat=lat,
+            lng=lng,
+            maps_url=google_maps_url(place.get("name", name), place.get("place_id")),
+            price_level=price_level,
+            source="suggestion",
+        )
+    return None
 
 
 def validate_suggestion(
