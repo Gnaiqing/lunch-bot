@@ -272,7 +272,7 @@ def _migrate_votes_to_multi_select(conn: sqlite3.Connection) -> None:
                 """
             )
             conn.execute("DROP TABLE votes_single_choice_legacy")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_votes_poll ON votes(poll_id)")
+            conn.execute("CREATE INDEX idx_votes_poll ON votes(poll_id)")
             conn.commit()
         except Exception:
             conn.rollback()
