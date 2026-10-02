@@ -6,9 +6,13 @@ from lunch_bot.models import Restaurant
 
 
 class _PlacesClient:
-    def __init__(self, results):
+    def __init__(self, results, *, geocode_results=None):
         self.results = results
+        self.geocode_results = geocode_results or []
         self.kwargs = None
+
+    def geocode(self, _address):
+        return self.geocode_results
 
     def places(self, **kwargs):
         self.kwargs = kwargs
@@ -80,6 +84,20 @@ def test_later_valid_place_is_used_when_first_result_is_invalid(monkeypatch):
     assert restaurant is not None
     assert restaurant.name == "Actual Restaurant"
     assert restaurant.place_id == "restaurant-2"
+
+
+def test_lookup_uses_geocoded_office_coordinates(monkeypatch):
+    office = {"geometry": {"location": {"lat": 44.0, "lng": -79.0}}}
+    client = _PlacesClient(
+        [_place(types=["restaurant"], lat=44.001, lng=-79.001)],
+        geocode_results=[office],
+    )
+    monkeypatch.setattr("lunch_bot.discovery._client", lambda _key: client)
+
+    restaurant = validate_suggestion(_config(), "Near Geocoded Office")
+
+    assert restaurant is not None
+    assert client.kwargs["location"] == (44.0, -79.0)
 
 
 def test_explore_nearby_filters_existing_and_criteria_then_ranks(monkeypatch):

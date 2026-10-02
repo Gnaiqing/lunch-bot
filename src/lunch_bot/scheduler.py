@@ -132,43 +132,54 @@ def close_poll_and_announce(
     bot never creates or places the order.
     """
     config.require("slack_channel_id")
-    open_poll = db.get_open_poll(conn, config.slack_channel_id)
-    if not open_poll:
-        logger.warning("No open poll to close + announce.")
-        return False
-    poll_id = open_poll["id"]
+    with polls.POLL_MESSAGE_LOCK:
+        open_poll = db.get_open_poll(conn, config.slack_channel_id)
+        if not open_poll:
+            logger.warning("No open poll to close + announce.")
+            return False
+        poll_id = open_poll["id"]
 
-    # Close + tally + winner selection happen in ONE atomic DB operation that
-    # serialises with vote recording on the same lock, so no vote can interleave
-    # between tallying and closing, and the (additive) totals fold is applied
-    # exactly once. ``applied`` is False if the poll was already closed (e.g. a
-    # concurrent/duplicate run won the race) — then there's nothing to announce.
-    applied, winner_id = db.close_poll_and_tally(conn, poll_id)
-    if not applied:
-        logger.warning("Poll %s was already closed; skipping tally + announce.", poll_id)
-        return False
-
-    # Disable the original vote buttons and show the final tally. Failure to
-    # refresh Slack must not reopen an already atomically closed poll.
-    if open_poll["slack_ts"]:
-        option_ids = db.get_poll_option_ids(conn, poll_id)
-        restaurants = [db.get_restaurant(conn, restaurant_id) for restaurant_id in option_ids]
-        restaurants = [restaurant for restaurant in restaurants if restaurant is not None]
-        try:
-            client.chat_update(
-                channel=config.slack_channel_id,
-                ts=open_poll["slack_ts"],
-                blocks=polls.build_poll_blocks(
-                    poll_id,
-                    restaurants,
-                    tally=db.tally_votes(conn, poll_id),
-                    voters=db.get_poll_voters(conn, poll_id),
-                    closed=True,
-                ),
-                text="Lunch poll closed",
+        # Close + tally + winner selection happen in ONE atomic DB operation that
+        # serialises with vote recording on the same lock, so no vote can interleave
+        # between tallying and closing, and the (additive) totals fold is applied
+        # exactly once. ``applied`` is False if the poll was already closed (e.g. a
+        # concurrent/duplicate run won the race) — then there's nothing to announce.
+        applied, winner_id = db.close_poll_and_tally(conn, poll_id)
+        if not applied:
+            logger.warning(
+                "Poll %s was already closed; skipping tally + announce.", poll_id
             )
-        except Exception as exc:  # pragma: no cover - Slack network best-effort
-            logger.warning("Closed poll %s but could not refresh its Slack message: %s", poll_id, exc)
+            return False
+
+        # Disable vote buttons while holding the same message lock used by vote
+        # handlers, guaranteeing that this closed render is the final render.
+        if open_poll["slack_ts"]:
+            option_ids = db.get_poll_option_ids(conn, poll_id)
+            restaurants = [
+                db.get_restaurant(conn, restaurant_id) for restaurant_id in option_ids
+            ]
+            restaurants = [
+                restaurant for restaurant in restaurants if restaurant is not None
+            ]
+            try:
+                client.chat_update(
+                    channel=config.slack_channel_id,
+                    ts=open_poll["slack_ts"],
+                    blocks=polls.build_poll_blocks(
+                        poll_id,
+                        restaurants,
+                        tally=db.tally_votes(conn, poll_id),
+                        voters=db.get_poll_voters(conn, poll_id),
+                        closed=True,
+                    ),
+                    text="Lunch poll closed",
+                )
+            except Exception as exc:  # pragma: no cover - Slack network best-effort
+                logger.warning(
+                    "Closed poll %s but could not refresh its Slack message: %s",
+                    poll_id,
+                    exc,
+                )
 
     if winner_id is None:
         client.chat_postMessage(

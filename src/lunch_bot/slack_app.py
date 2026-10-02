@@ -69,9 +69,9 @@ def build_app(config: Config, conn, llm=None):
 
     # Import here to avoid a cycle at module load; discovery pulls in googlemaps
     # only when actually called.
-    from .discovery import google_maps_url, validate_suggestion
+    from .discovery import google_maps_url, lookup_restaurant, validate_suggestion
 
-    def find_restaurant_suggestion(query: str):
+    def find_restaurant_suggestion(query: str, *, enforce_budget: bool = True):
         """Resolve a query through Google Places without persisting anything."""
         name = query
         location_hint = None
@@ -84,11 +84,23 @@ def build_app(config: Config, conn, llm=None):
                 pass
 
         try:
-            restaurant = validate_suggestion(config, name, location_hint)
+            if enforce_budget:
+                restaurant = validate_suggestion(config, name, location_hint)
+            else:
+                # A manager may refresh metadata for an already-approved
+                # candidate even when Google's coarse price level is above the
+                # discovery budget. Restaurant and distance checks still apply.
+                restaurant = lookup_restaurant(
+                    config,
+                    name,
+                    location_hint,
+                    enforce_budget=False,
+                )
         except Exception as exc:  # pragma: no cover - network best-effort
             return None, f"Couldn't validate '{name}' right now: {exc}"
         if restaurant is None:
-            return None, f"Hmm, I couldn't find '{name}' on Google Places within our budget."
+            qualifier = " within our budget" if enforce_budget else ""
+            return None, f"Hmm, I couldn't find a nearby restaurant named '{name}' on Google Places{qualifier}."
 
         return restaurant, None
 
@@ -102,7 +114,10 @@ def build_app(config: Config, conn, llm=None):
         target_restaurant_id: int | None = None,
     ) -> tuple[bool, str | None]:
         """Post a confirmation card while keeping the match out of the pool."""
-        restaurant, error = find_restaurant_suggestion(query)
+        restaurant, error = find_restaurant_suggestion(
+            query,
+            enforce_budget=target != "refresh",
+        )
         if restaurant is None:
             return False, error
         user_id = event.get("user")
@@ -362,33 +377,31 @@ def build_app(config: Config, conn, llm=None):
         )
 
     def update_poll_message(poll_id: int, client) -> bool:
-        poll = db.get_poll(conn, poll_id)
-        if poll is None or poll["status"] != "open" or not poll["slack_ts"]:
-            return False
-        option_ids = db.get_poll_option_ids(conn, poll_id)
-        restaurants = [db.get_restaurant(conn, restaurant_id) for restaurant_id in option_ids]
-        restaurants = [restaurant for restaurant in restaurants if restaurant is not None]
-        client.chat_update(
-            channel=poll["slack_channel"],
-            ts=poll["slack_ts"],
-            blocks=polls.build_poll_blocks(
-                poll_id,
-                restaurants,
-                tally=db.tally_votes(conn, poll_id),
-                voters=db.get_poll_voters(conn, poll_id),
-            ),
-            text="Lunch poll updated",
-        )
-        return True
+        with polls.POLL_MESSAGE_LOCK:
+            poll = db.get_poll(conn, poll_id)
+            if poll is None or poll["status"] != "open" or not poll["slack_ts"]:
+                return False
+            option_ids = db.get_poll_option_ids(conn, poll_id)
+            restaurants = [
+                db.get_restaurant(conn, restaurant_id) for restaurant_id in option_ids
+            ]
+            restaurants = [
+                restaurant for restaurant in restaurants if restaurant is not None
+            ]
+            client.chat_update(
+                channel=poll["slack_channel"],
+                ts=poll["slack_ts"],
+                blocks=polls.build_poll_blocks(
+                    poll_id,
+                    restaurants,
+                    tally=db.tally_votes(conn, poll_id),
+                    voters=db.get_poll_voters(conn, poll_id),
+                ),
+                text="Lunch poll updated",
+            )
+            return True
 
     def handle_create_poll(command: MentionCommand, event, say, client) -> None:
-        existing_poll = db.get_open_poll(conn, config.slack_channel_id)
-        if existing_poll is not None:
-            say(
-                "There is already an open lunch poll, so I left it and its votes unchanged. "
-                "Add choices with `@lunch-bot add <restaurant or cuisine> to the open poll`."
-            )
-            return
         if command.count is not None:
             count = command.count
         elif len(command.queries) >= 2:
@@ -448,8 +461,9 @@ def build_app(config: Config, conn, llm=None):
         if poll_id is None:
             if db.get_open_poll(conn, config.slack_channel_id) is not None:
                 say(
-                    "Another request created a poll first, so I left that poll and its "
-                    "choices unchanged."
+                    "There is already an open lunch poll, so I left it and its votes "
+                    "unchanged. Add choices with `@lunch-bot add <restaurant or cuisine> "
+                    "to the open poll`."
                 )
             else:
                 say(
@@ -477,9 +491,22 @@ def build_app(config: Config, conn, llm=None):
                     f"The poll already has the maximum of {config.max_poll_options} choices."
                 )
                 break
+            excluded_ids = existing_ids | set(added_ids)
+            if not is_cuisine:
+                existing_match, ambiguous = choose_from_pool(query)
+                if ambiguous:
+                    failures.append(
+                        f"'{query}' matches multiple restaurants: {', '.join(ambiguous)}. "
+                        "Please use the full name."
+                    )
+                    continue
+                if existing_match is not None and existing_match.id in excluded_ids:
+                    failures.append(f"'{existing_match.name}' is already in the poll.")
+                    continue
+
             restaurant, ambiguous = choose_from_pool(
                 query,
-                excluding=existing_ids | set(added_ids),
+                excluding=excluded_ids,
                 cuisine=is_cuisine,
             )
             if ambiguous:
@@ -614,9 +641,15 @@ def build_app(config: Config, conn, llm=None):
         confirmed: bool = False,
         confirmed_target_ids: list[int] | None = None,
         confirmed_poll_id: int | None = None,
-    ) -> None:
-        if not from_pool and confirmed_poll_id is not None:
-            poll = db.get_poll(conn, confirmed_poll_id)
+    ) -> bool:
+        if confirmed:
+            # A confirmation applies to the poll visible when its card was
+            # created. Never substitute a replacement poll that opened later.
+            poll = (
+                db.get_poll(conn, confirmed_poll_id)
+                if confirmed_poll_id is not None
+                else None
+            )
             if poll is not None and poll["status"] != "open":
                 poll = None
         else:
@@ -629,7 +662,7 @@ def build_app(config: Config, conn, llm=None):
         else:
             if poll is None:
                 say("There is no open poll to remove choices from.")
-                return
+                return False
             collection = [
                 restaurant
                 for restaurant_id in poll_option_ids
@@ -654,7 +687,7 @@ def build_app(config: Config, conn, llm=None):
             )
         if not targets:
             say("\n".join(failures) if failures else "No matching restaurants were removed.")
-            return
+            return False
         if len(targets) > 1 and not confirmed:
             requested = request_bulk_confirmation(
                 command,
@@ -669,49 +702,60 @@ def build_app(config: Config, conn, llm=None):
                 if requested
                 else "I couldn't post the confirmation card, so nothing was changed."
             )
-            return
+            return requested
 
         target_ids = {restaurant.id for restaurant in targets}
         poll_removals = target_ids & poll_option_ids
         if poll_removals:
-            if not poll or not poll["slack_ts"]:
-                say("The open poll has no Slack message to update, so I changed nothing.")
-                return
-            remaining_ids = [
-                restaurant_id
-                for restaurant_id in db.get_poll_option_ids(conn, poll["id"])
-                if restaurant_id not in poll_removals
-            ]
-            remaining = [
-                restaurant
-                for restaurant_id in remaining_ids
-                if (restaurant := db.get_restaurant(conn, restaurant_id)) is not None
-            ]
-            current_tally = db.tally_votes(conn, poll["id"])
-            current_voters = db.get_poll_voters(conn, poll["id"])
-            try:
-                client.chat_update(
-                    channel=poll["slack_channel"],
-                    ts=poll["slack_ts"],
-                    blocks=polls.build_poll_blocks(
-                        poll["id"],
-                        remaining,
-                        tally={
-                            restaurant_id: current_tally.get(restaurant_id, 0)
-                            for restaurant_id in remaining_ids
-                        },
-                        voters={
-                            restaurant_id: current_voters.get(restaurant_id, [])
-                            for restaurant_id in remaining_ids
-                        },
-                    ),
-                    text="Lunch poll updated",
-                )
-            except Exception as exc:  # pragma: no cover - Slack network best-effort
-                say(f"I couldn't update the Slack poll, so I changed nothing: {exc}")
-                return
-            for restaurant_id in poll_removals:
-                db.remove_poll_option(conn, poll["id"], restaurant_id)
+            with polls.POLL_MESSAGE_LOCK:
+                live_poll = db.get_poll(conn, poll["id"]) if poll else None
+                if live_poll is None or live_poll["status"] != "open":
+                    if not from_pool:
+                        say("The approved poll is no longer open, so I changed nothing.")
+                        return False
+                    # Candidate removal still applies, but never rewrite a closed
+                    # poll or whichever replacement poll is now current.
+                    poll_removals = set()
+                elif not live_poll["slack_ts"]:
+                    say("The open poll has no Slack message to update, so I changed nothing.")
+                    return False
+
+                if poll_removals:
+                    remaining_ids = [
+                        restaurant_id
+                        for restaurant_id in db.get_poll_option_ids(conn, live_poll["id"])
+                        if restaurant_id not in poll_removals
+                    ]
+                    remaining = [
+                        restaurant
+                        for restaurant_id in remaining_ids
+                        if (restaurant := db.get_restaurant(conn, restaurant_id)) is not None
+                    ]
+                    current_tally = db.tally_votes(conn, live_poll["id"])
+                    current_voters = db.get_poll_voters(conn, live_poll["id"])
+                    try:
+                        client.chat_update(
+                            channel=live_poll["slack_channel"],
+                            ts=live_poll["slack_ts"],
+                            blocks=polls.build_poll_blocks(
+                                live_poll["id"],
+                                remaining,
+                                tally={
+                                    restaurant_id: current_tally.get(restaurant_id, 0)
+                                    for restaurant_id in remaining_ids
+                                },
+                                voters={
+                                    restaurant_id: current_voters.get(restaurant_id, [])
+                                    for restaurant_id in remaining_ids
+                                },
+                            ),
+                            text="Lunch poll updated",
+                        )
+                    except Exception as exc:  # pragma: no cover - Slack network best-effort
+                        say(f"I couldn't update the Slack poll, so I changed nothing: {exc}")
+                        return False
+                    for restaurant_id in poll_removals:
+                        db.remove_poll_option(conn, live_poll["id"], restaurant_id)
 
         if from_pool:
             db.set_restaurants_active(conn, target_ids, active=False)
@@ -725,6 +769,7 @@ def build_app(config: Config, conn, llm=None):
         if failures:
             message += "\n" + "\n".join(failures)
         say(message)
+        return True
 
     def handle_close_poll(
         command: MentionCommand,
@@ -805,6 +850,9 @@ def build_app(config: Config, conn, llm=None):
             say("\n".join(failures) if failures else "Please use the exact restaurant name.")
             return
         source = sources[0]
+        poll = db.get_open_poll(conn, config.slack_channel_id)
+        poll_option_ids = set(db.get_poll_option_ids(conn, poll["id"])) if poll else set()
+        refresh_poll = source.id in poll_option_ids
 
         if command.kind == "rename_restaurant":
             db.rename_restaurant(conn, source.id, command.queries[1])
@@ -826,6 +874,7 @@ def build_app(config: Config, conn, llm=None):
             if destination.id == source.id:
                 say("Those names resolve to the same restaurant; nothing changed.")
                 return
+            refresh_poll = refresh_poll or destination.id in poll_option_ids
             db.merge_restaurants(conn, source.id, destination.id)
             message = f"Merged duplicate *{source.name}* into *{destination.name}*."
         else:  # refresh_location
@@ -844,45 +893,51 @@ def build_app(config: Config, conn, llm=None):
             )
             return
 
-        poll = db.get_open_poll(conn, config.slack_channel_id)
-        if poll and source.id in db.get_poll_option_ids(conn, poll["id"]):
-            update_poll_message(poll["id"], client)
+        if poll and refresh_poll:
+            try:
+                update_poll_message(poll["id"], client)
+            except Exception as exc:  # pragma: no cover - Slack network best-effort
+                message += (
+                    " The database change was saved, but I couldn't refresh the "
+                    f"poll message: {exc}"
+                )
         say(message)
 
     def handle_cancel_poll(say, client) -> None:
-        poll = db.get_open_poll(conn, config.slack_channel_id)
-        if poll is None:
-            say("There is no open poll to cancel.")
-            return
-        if not db.cancel_poll_if_open(conn, poll["id"]):
-            say("The poll was already closed or cancelled.")
-            return
-        restaurants = [
-            restaurant
-            for restaurant_id in db.get_poll_option_ids(conn, poll["id"])
-            if (restaurant := db.get_restaurant(conn, restaurant_id)) is not None
-        ]
-        if poll["slack_ts"]:
-            try:
-                client.chat_update(
-                    channel=poll["slack_channel"],
-                    ts=poll["slack_ts"],
-                    blocks=polls.build_poll_blocks(
-                        poll["id"],
-                        restaurants,
-                        tally=db.tally_votes(conn, poll["id"]),
-                        voters=db.get_poll_voters(conn, poll["id"]),
-                        closed=True,
-                        header="🍽️ Group Lunch — Cancelled",
-                    ),
-                    text="Lunch poll cancelled",
-                )
-            except Exception as exc:  # pragma: no cover - Slack network best-effort
-                say(
-                    "The poll was cancelled in the database, but I couldn't refresh its "
-                    f"Slack message: {exc}"
-                )
+        with polls.POLL_MESSAGE_LOCK:
+            poll = db.get_open_poll(conn, config.slack_channel_id)
+            if poll is None:
+                say("There is no open poll to cancel.")
                 return
+            if not db.cancel_poll_if_open(conn, poll["id"]):
+                say("The poll was already closed or cancelled.")
+                return
+            restaurants = [
+                restaurant
+                for restaurant_id in db.get_poll_option_ids(conn, poll["id"])
+                if (restaurant := db.get_restaurant(conn, restaurant_id)) is not None
+            ]
+            if poll["slack_ts"]:
+                try:
+                    client.chat_update(
+                        channel=poll["slack_channel"],
+                        ts=poll["slack_ts"],
+                        blocks=polls.build_poll_blocks(
+                            poll["id"],
+                            restaurants,
+                            tally=db.tally_votes(conn, poll["id"]),
+                            voters=db.get_poll_voters(conn, poll["id"]),
+                            closed=True,
+                            header="🍽️ Group Lunch — Cancelled",
+                        ),
+                        text="Lunch poll cancelled",
+                    )
+                except Exception as exc:  # pragma: no cover - Slack network best-effort
+                    say(
+                        "The poll was cancelled in the database, but I couldn't refresh its "
+                        f"Slack message: {exc}"
+                    )
+                    return
         say("Cancelled the current poll without selecting or recording a winner.")
 
     @app.event("app_mention")
@@ -1137,14 +1192,20 @@ def build_app(config: Config, conn, llm=None):
             return
         channel, ts = action_message_location(body)
 
+        notification_failed = False
+
         def report(message: str) -> None:
+            nonlocal notification_failed
             if channel and ts:
-                client.chat_update(
-                    channel=channel,
-                    ts=ts,
-                    text=message,
-                    blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": message}}],
-                )
+                try:
+                    client.chat_update(
+                        channel=channel,
+                        ts=ts,
+                        text=message,
+                        blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": message}}],
+                    )
+                except Exception:  # pragma: no cover - Slack network best-effort
+                    notification_failed = True
 
         try:
             payload = json.loads(pending["payload"])
@@ -1153,7 +1214,7 @@ def build_app(config: Config, conn, llm=None):
                 queries=payload.get("queries", []),
                 cuisines=payload.get("cuisines", []),
             )
-            handle_remove(
+            applied = handle_remove(
                 command,
                 {"user": user_id, "channel": channel},
                 report,
@@ -1163,7 +1224,18 @@ def build_app(config: Config, conn, llm=None):
                 confirmed_target_ids=payload.get("target_ids"),
                 confirmed_poll_id=payload.get("poll_id"),
             )
-            db.resolve_pending_manager_action(conn, token, "confirmed")
+            db.resolve_pending_manager_action(
+                conn, token, "confirmed" if applied else "failed"
+            )
+            if applied and notification_failed:
+                try:
+                    action_error(
+                        client,
+                        body,
+                        "The removal was completed, but I couldn't refresh the confirmation card.",
+                    )
+                except Exception:  # pragma: no cover - Slack is unavailable
+                    pass
         except Exception:
             db.resolve_pending_manager_action(conn, token, "failed")
             raise
@@ -1229,6 +1301,16 @@ def build_app(config: Config, conn, llm=None):
                 db.update_restaurant_location(conn, target.id, restaurant)
                 db.resolve_pending_restaurant_confirmation(conn, token, "confirmed")
                 message = f"Updated the stored Google Maps location for *{target.name}*."
+                poll = db.get_open_poll(conn, config.slack_channel_id)
+                if poll and target.id in db.get_poll_option_ids(conn, poll["id"]):
+                    try:
+                        if not update_poll_message(poll["id"], client):
+                            message += " The open poll changed before its message could be refreshed."
+                    except Exception as exc:  # pragma: no cover - Slack network best-effort
+                        message += (
+                            " The database change was saved, but I couldn't refresh the "
+                            f"poll message: {exc}"
+                        )
                 channel, ts = action_message_location(body)
                 if channel and ts:
                     try:
@@ -1294,12 +1376,24 @@ def build_app(config: Config, conn, llm=None):
                 message += " The requested poll was no longer available to update."
         channel, ts = action_message_location(body)
         if channel and ts:
-            client.chat_update(
-                channel=channel,
-                ts=ts,
-                text=message,
-                blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": message}}],
-            )
+            try:
+                client.chat_update(
+                    channel=channel,
+                    ts=ts,
+                    text=message,
+                    blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": message}}],
+                )
+            except Exception:
+                # The candidate/poll changes and confirmation status are already
+                # committed. Report the delivery issue without changing state.
+                try:
+                    action_error(
+                        client,
+                        body,
+                        message + " I couldn't refresh the confirmation message.",
+                    )
+                except Exception:  # pragma: no cover - Slack is unavailable
+                    pass
 
     @app.action("restaurant_cancel")
     def handle_restaurant_cancel(ack, body, client):
@@ -1335,25 +1429,39 @@ def build_app(config: Config, conn, llm=None):
         ack()
         action = body["actions"][0]
         user_id = body["user"]["id"]
-        result = polls.handle_vote(conn, action["action_id"], user_id)
-        if not result:
-            return
-        poll_id, _ = result
+        with polls.POLL_MESSAGE_LOCK:
+            result = polls.handle_vote(conn, action["action_id"], user_id)
+            if not result:
+                return
+            poll_id, _ = result
 
-        # Refresh the poll message with the updated tally.
-        option_ids = db.get_poll_option_ids(conn, poll_id)
-        restaurants = [db.get_restaurant(conn, rid) for rid in option_ids]
-        restaurants = [r for r in restaurants if r is not None]
-        tally = db.tally_votes(conn, poll_id)
-        voters = db.get_poll_voters(conn, poll_id)
-        blocks = polls.build_poll_blocks(
-            poll_id, restaurants, tally=tally, voters=voters
-        )
+            # Read status and render while holding the same lock as poll closure.
+            # A close can therefore never publish its read-only view and then be
+            # overwritten by this older vote render with active buttons.
+            poll = db.get_poll(conn, poll_id)
+            closed = poll is None or poll["status"] != "open"
+            option_ids = db.get_poll_option_ids(conn, poll_id)
+            restaurants = [db.get_restaurant(conn, rid) for rid in option_ids]
+            restaurants = [r for r in restaurants if r is not None]
+            tally = db.tally_votes(conn, poll_id)
+            voters = db.get_poll_voters(conn, poll_id)
+            blocks = polls.build_poll_blocks(
+                poll_id,
+                restaurants,
+                tally=tally,
+                voters=voters,
+                closed=closed,
+            )
 
-        container = body.get("container", {})
-        channel = body.get("channel", {}).get("id") or config.slack_channel_id
-        ts = container.get("message_ts")
-        if channel and ts:
-            client.chat_update(channel=channel, ts=ts, blocks=blocks, text="Lunch poll updated")
+            container = body.get("container", {})
+            channel = body.get("channel", {}).get("id") or config.slack_channel_id
+            ts = container.get("message_ts")
+            if channel and ts:
+                client.chat_update(
+                    channel=channel,
+                    ts=ts,
+                    blocks=blocks,
+                    text="Lunch poll closed" if closed else "Lunch poll updated",
+                )
 
     return app

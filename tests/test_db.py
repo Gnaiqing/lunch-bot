@@ -210,6 +210,10 @@ def test_init_db_migrates_legacy_single_choice_votes(tmp_path):
     assert db.tally_votes(migrated, 1) == {1: 1}
     assert db.record_vote_if_open(migrated, 1, 2, "U1") is True
     assert db.tally_votes(migrated, 1) == {1: 1, 2: 1}
+    indexes = {
+        row[1] for row in migrated.execute("PRAGMA index_list(votes)").fetchall()
+    }
+    assert "idx_votes_poll" in indexes
 
 
 def test_init_db_adds_maps_url_to_legacy_tables(tmp_path):

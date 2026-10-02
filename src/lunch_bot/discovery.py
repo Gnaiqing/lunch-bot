@@ -263,11 +263,12 @@ def lookup_restaurant(
     ``enforce_budget=False`` is used when enriching already-approved candidates.
     """
     config.require("google_maps_api_key")
+    office_lat, office_lng = geocode_office(config)
     gmaps = _client(config.google_maps_api_key)
     query = name if not location_hint else f"{name} {location_hint}"
     response = gmaps.places(
         query=query,
-        location=(config.office_lat, config.office_lng),
+        location=(office_lat, office_lng),
         radius=config.search_radius_m,
         type="restaurant",
     )
@@ -289,7 +290,7 @@ def lookup_restaurant(
         if lat is None or lng is None:
             continue
         if (
-            _distance_m(config.office_lat, config.office_lng, lat, lng)
+            _distance_m(office_lat, office_lng, lat, lng)
             > config.search_radius_m
         ):
             continue

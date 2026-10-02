@@ -10,6 +10,7 @@ plain dict payloads (Block Kit JSON), so it can be unit-tested without Slack.
 
 from __future__ import annotations
 
+import threading
 from typing import Optional
 
 from . import db
@@ -17,6 +18,11 @@ from .models import Restaurant
 
 # action_id prefix for a vote button: "vote::<poll_id>::<restaurant_id>"
 VOTE_ACTION_PREFIX = "vote"
+
+# Slack message updates are not transactional with SQLite writes. Serialize every
+# vote/close render in this process so an older open-poll render cannot arrive
+# after the close render and visually restore vote buttons.
+POLL_MESSAGE_LOCK = threading.RLock()
 
 
 def vote_action_id(poll_id: int, restaurant_id: int) -> str:

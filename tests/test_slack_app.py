@@ -1,8 +1,9 @@
 """Network-free integration tests for conversational Slack mention handling."""
 
 import json
+import threading
 
-from lunch_bot import db
+from lunch_bot import db, polls, scheduler
 from lunch_bot.commands import MentionCommand, parse_mention_command
 from lunch_bot.config import load_config
 from lunch_bot.discovery import NearbyRecommendation
@@ -57,6 +58,19 @@ class _FailingUpdateClient(_FakeSlackClient):
 class _FailingPostClient(_FakeSlackClient):
     def chat_postMessage(self, **kwargs):
         raise RuntimeError("Slack post failed")
+
+
+class _BlockingVoteUpdateClient(_FakeSlackClient):
+    def __init__(self):
+        super().__init__()
+        self.vote_update_started = threading.Event()
+        self.release_vote_update = threading.Event()
+
+    def chat_update(self, **kwargs):
+        if kwargs.get("text") == "Lunch poll updated":
+            self.vote_update_started.set()
+            assert self.release_vote_update.wait(timeout=5)
+        return super().chat_update(**kwargs)
 
 
 class _RoutingLLM:
@@ -519,6 +533,45 @@ def test_add_existing_choice_preserves_poll_options_votes_and_message(monkeypatc
     assert "Added to the current poll" in replies[0]
 
 
+def test_adding_choice_already_in_poll_does_not_start_google_confirmation(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr("slack_bolt.App", _FakeBoltApp)
+    monkeypatch.setattr(
+        "lunch_bot.discovery.validate_suggestion",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("an existing poll choice must not reach Google lookup")
+        ),
+    )
+    config = load_config(
+        env={"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_CHANNEL_ID": "C_TEST"},
+        load_dotenv=False,
+        config_path="__none__.yaml",
+    )
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    restaurant_id = db.upsert_restaurant(conn, Restaurant(name="Miznon"))
+    poll_id = db.create_poll(conn, "C_TEST", [restaurant_id])
+    db.set_poll_ts(conn, poll_id, "1700000000.000110")
+    app = build_app(
+        config,
+        conn,
+        llm=_FixedRouter(MentionCommand("add_to_poll", queries=["Miznon"])),
+    )
+    client = _FakeSlackClient()
+    replies = []
+
+    app.events["app_mention"](
+        event={"channel": "C_TEST", "user": "U_REQUESTER", "text": "add Miznon"},
+        say=replies.append,
+        client=client,
+    )
+
+    assert db.get_poll_option_ids(conn, poll_id) == [restaurant_id]
+    assert client.posts == []
+    assert client.updates == []
+    assert "already in the poll" in replies[0]
+
+
 def test_manual_create_refuses_to_replace_open_poll(monkeypatch, tmp_path):
     monkeypatch.setattr("slack_bolt.App", _FakeBoltApp)
     config = load_config(
@@ -855,6 +908,113 @@ def test_failed_bulk_confirmation_post_marks_action_failed(monkeypatch, tmp_path
     assert "couldn't post the confirmation card" in replies[0]
 
 
+def test_candidate_removal_confirmation_does_not_touch_replacement_poll(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr("slack_bolt.App", _FakeBoltApp)
+    config = load_config(
+        env={
+            "SLACK_BOT_TOKEN": "xoxb-test",
+            "SLACK_CHANNEL_ID": "C_TEST",
+            "SLACK_MANAGER_USER_IDS": "U_MANAGER",
+        },
+        load_dotenv=False,
+        config_path="__none__.yaml",
+    )
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    remove_ids = [
+        db.upsert_restaurant(conn, Restaurant(name=f"Hotel {index}", cuisine="other"))
+        for index in range(2)
+    ]
+    keep_id = db.upsert_restaurant(
+        conn, Restaurant(name="Miznon", cuisine="Mediterranean")
+    )
+    original_poll_id = db.create_poll(conn, "C_TEST", [remove_ids[0], keep_id])
+    db.set_poll_ts(conn, original_poll_id, "1700000000.000801")
+    app = build_app(
+        config,
+        conn,
+        llm=_FixedRouter(MentionCommand("remove_from_pool", cuisines=["other"])),
+    )
+    client = _FakeSlackClient()
+    app.events["app_mention"](
+        event={"channel": "C_TEST", "user": "U_MANAGER", "text": "remove other"},
+        say=lambda _message: None,
+        client=client,
+    )
+    token = client.posts[0]["blocks"][1]["elements"][0]["value"]
+
+    db.cancel_poll_if_open(conn, original_poll_id)
+    replacement_poll_id = db.create_poll(conn, "C_TEST", [remove_ids[0], keep_id])
+    db.set_poll_ts(conn, replacement_poll_id, "1700000000.000802")
+    actions = {pattern: handler for pattern, handler in app.actions if isinstance(pattern, str)}
+    actions["manager_action_confirm"](
+        ack=lambda: None,
+        body={
+            "actions": [{"value": token}],
+            "user": {"id": "U_MANAGER"},
+            "channel": {"id": "C_TEST"},
+            "container": {"message_ts": "1700000000.000803"},
+        },
+        client=client,
+    )
+
+    assert db.get_poll_option_ids(conn, replacement_poll_id) == [remove_ids[0], keep_id]
+    assert {restaurant.id for restaurant in db.get_inactive_restaurants(conn)} == set(
+        remove_ids
+    )
+    assert db.get_pending_manager_action(conn, token)["status"] == "confirmed"
+
+
+def test_removal_notification_failure_keeps_action_confirmed(monkeypatch, tmp_path):
+    monkeypatch.setattr("slack_bolt.App", _FakeBoltApp)
+    config = load_config(
+        env={
+            "SLACK_BOT_TOKEN": "xoxb-test",
+            "SLACK_CHANNEL_ID": "C_TEST",
+            "SLACK_MANAGER_USER_IDS": "U_MANAGER",
+        },
+        load_dotenv=False,
+        config_path="__none__.yaml",
+    )
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    remove_ids = [
+        db.upsert_restaurant(conn, Restaurant(name=f"Hotel {index}", cuisine="other"))
+        for index in range(2)
+    ]
+    app = build_app(
+        config,
+        conn,
+        llm=_FixedRouter(MentionCommand("remove_from_pool", cuisines=["other"])),
+    )
+    initial_client = _FakeSlackClient()
+    app.events["app_mention"](
+        event={"channel": "C_TEST", "user": "U_MANAGER", "text": "remove other"},
+        say=lambda _message: None,
+        client=initial_client,
+    )
+    token = initial_client.posts[0]["blocks"][1]["elements"][0]["value"]
+    failing_client = _FailingUpdateClient()
+    actions = {pattern: handler for pattern, handler in app.actions if isinstance(pattern, str)}
+
+    actions["manager_action_confirm"](
+        ack=lambda: None,
+        body={
+            "actions": [{"value": token}],
+            "user": {"id": "U_MANAGER"},
+            "channel": {"id": "C_TEST"},
+            "container": {"message_ts": "1700000000.000804"},
+        },
+        client=failing_client,
+    )
+
+    assert {restaurant.id for restaurant in db.get_inactive_restaurants(conn)} == set(
+        remove_ids
+    )
+    assert db.get_pending_manager_action(conn, token)["status"] == "confirmed"
+    assert "removal was completed" in failing_client.ephemeral[0]["text"]
+
+
 def test_router_failure_uses_safe_read_only_fallback(monkeypatch, tmp_path):
     monkeypatch.setattr("slack_bolt.App", _FakeBoltApp)
     config = load_config(
@@ -984,6 +1144,64 @@ def test_manager_closes_poll_disables_voting_and_announces_winner(monkeypatch, t
     )
     assert any("winner" in post["text"].lower() for post in client.posts)
     assert "Voting is now disabled" in replies[0]
+
+
+def test_in_flight_vote_cannot_overwrite_closed_poll_message(monkeypatch, tmp_path):
+    monkeypatch.setattr("slack_bolt.App", _FakeBoltApp)
+    config = load_config(
+        env={"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_CHANNEL_ID": "C_TEST"},
+        load_dotenv=False,
+        config_path="__none__.yaml",
+    )
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    restaurant_id = db.upsert_restaurant(conn, Restaurant(name="Miznon"))
+    poll_id = db.create_poll(conn, "C_TEST", [restaurant_id])
+    db.set_poll_ts(conn, poll_id, "1700000000.000700")
+    app = build_app(config, conn, llm=_RoutingLLM())
+    vote_handler = next(
+        handler
+        for pattern, handler in app.actions
+        if hasattr(pattern, "match") and pattern.match("vote::1::1")
+    )
+    client = _BlockingVoteUpdateClient()
+    vote_thread = threading.Thread(
+        target=vote_handler,
+        kwargs={
+            "ack": lambda: None,
+            "body": {
+                "actions": [
+                    {"action_id": polls.vote_action_id(poll_id, restaurant_id)}
+                ],
+                "user": {"id": "U_VOTER"},
+                "channel": {"id": "C_TEST"},
+                "container": {"message_ts": "1700000000.000700"},
+            },
+            "client": client,
+        },
+    )
+    close_finished = threading.Event()
+
+    def close_poll():
+        scheduler.close_poll_and_announce(config, conn, client)
+        close_finished.set()
+
+    vote_thread.start()
+    assert client.vote_update_started.wait(timeout=5)
+    close_thread = threading.Thread(target=close_poll)
+    close_thread.start()
+    assert not close_finished.wait(timeout=0.1)
+    client.release_vote_update.set()
+    vote_thread.join(timeout=5)
+    close_thread.join(timeout=5)
+
+    assert not vote_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert client.updates[-1]["text"] == "Lunch poll closed"
+    assert all(
+        "accessory" not in block
+        for block in client.updates[-1]["blocks"]
+        if block["type"] == "section"
+    )
 
 
 def test_manager_closes_then_creates_four_choice_poll(monkeypatch, tmp_path):
@@ -1159,16 +1377,95 @@ def test_manager_restores_and_edits_candidate(monkeypatch, tmp_path):
     assert db.get_restaurant(conn, restaurant_id).cuisine == "Italian"
 
 
+def test_metadata_change_reports_success_when_poll_refresh_fails(monkeypatch, tmp_path):
+    monkeypatch.setattr("slack_bolt.App", _FakeBoltApp)
+    config = load_config(
+        env={
+            "SLACK_BOT_TOKEN": "xoxb-test",
+            "SLACK_CHANNEL_ID": "C_TEST",
+            "SLACK_MANAGER_USER_IDS": "U_MANAGER",
+        },
+        load_dotenv=False,
+        config_path="__none__.yaml",
+    )
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    restaurant_id = db.upsert_restaurant(conn, Restaurant(name="Old Name"))
+    poll_id = db.create_poll(conn, "C_TEST", [restaurant_id])
+    db.set_poll_ts(conn, poll_id, "1700000000.000901")
+    app = build_app(
+        config,
+        conn,
+        llm=_FixedRouter(
+            MentionCommand("rename_restaurant", queries=["Old Name", "New Name"])
+        ),
+    )
+    replies = []
+
+    app.events["app_mention"](
+        event={"channel": "C_TEST", "user": "U_MANAGER", "text": "rename"},
+        say=replies.append,
+        client=_FailingUpdateClient(),
+    )
+
+    assert db.get_restaurant(conn, restaurant_id).name == "New Name"
+    assert "Renamed" in replies[0]
+    assert "database change was saved" in replies[0]
+
+
+def test_merging_poll_choice_refreshes_open_poll_message(monkeypatch, tmp_path):
+    monkeypatch.setattr("slack_bolt.App", _FakeBoltApp)
+    config = load_config(
+        env={
+            "SLACK_BOT_TOKEN": "xoxb-test",
+            "SLACK_CHANNEL_ID": "C_TEST",
+            "SLACK_MANAGER_USER_IDS": "U_MANAGER",
+        },
+        load_dotenv=False,
+        config_path="__none__.yaml",
+    )
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    duplicate_id = db.upsert_restaurant(conn, Restaurant(name="Miznon Duplicate"))
+    canonical_id = db.upsert_restaurant(conn, Restaurant(name="Miznon"))
+    poll_id = db.create_poll(conn, "C_TEST", [duplicate_id])
+    db.set_poll_ts(conn, poll_id, "1700000000.000905")
+    app = build_app(
+        config,
+        conn,
+        llm=_FixedRouter(
+            MentionCommand(
+                "merge_restaurants", queries=["Miznon Duplicate", "Miznon"]
+            )
+        ),
+    )
+    client = _FakeSlackClient()
+
+    app.events["app_mention"](
+        event={"channel": "C_TEST", "user": "U_MANAGER", "text": "merge"},
+        say=lambda _message: None,
+        client=client,
+    )
+
+    assert db.get_poll_option_ids(conn, poll_id) == [canonical_id]
+    assert len(client.updates) == 1
+    assert client.updates[0]["ts"] == "1700000000.000905"
+
+
 def test_manager_refreshes_location_after_google_confirmation(monkeypatch, tmp_path):
     monkeypatch.setattr("slack_bolt.App", _FakeBoltApp)
-    monkeypatch.setattr(
-        "lunch_bot.discovery.validate_suggestion",
-        lambda _config, _name, _location=None: Restaurant(
+    lookup_calls = []
+
+    def lookup(_config, _name, _location=None, *, enforce_budget=True):
+        lookup_calls.append(enforce_budget)
+        return Restaurant(
             name="Miznon Toronto",
             address="123 Bay St",
             place_id="new-place",
             maps_url="https://maps.example/new",
-        ),
+        )
+
+    monkeypatch.setattr(
+        "lunch_bot.discovery.lookup_restaurant",
+        lookup,
     )
     config = load_config(
         env={
@@ -1181,6 +1478,8 @@ def test_manager_refreshes_location_after_google_confirmation(monkeypatch, tmp_p
     )
     conn = db.init_db(str(tmp_path / "lunch.db"))
     restaurant_id = db.upsert_restaurant(conn, Restaurant(name="Miznon"))
+    poll_id = db.create_poll(conn, "C_TEST", [restaurant_id])
+    db.set_poll_ts(conn, poll_id, "1700000000.000601")
     app = build_app(
         config,
         conn,
@@ -1210,6 +1509,9 @@ def test_manager_refreshes_location_after_google_confirmation(monkeypatch, tmp_p
     assert updated.address == "123 Bay St"
     assert updated.maps_url == "https://maps.example/new"
     assert len(conn.execute("SELECT * FROM restaurants").fetchall()) == 1
+    assert lookup_calls == [False]
+    assert len(client.updates) == 2
+    assert client.updates[0]["ts"] == "1700000000.000601"
 
 
 def test_only_manager_can_send_manual_order_reminder(monkeypatch, tmp_path):
@@ -1346,8 +1648,8 @@ def test_empty_pool_replacement_does_not_close_current_poll(monkeypatch, tmp_pat
 def test_refresh_notification_failure_keeps_confirmation_confirmed(monkeypatch, tmp_path):
     monkeypatch.setattr("slack_bolt.App", _FakeBoltApp)
     monkeypatch.setattr(
-        "lunch_bot.discovery.validate_suggestion",
-        lambda _config, _name, _location=None: Restaurant(
+        "lunch_bot.discovery.lookup_restaurant",
+        lambda _config, _name, _location=None, *, enforce_budget=True: Restaurant(
             name="Miznon Toronto",
             address="123 Bay St",
             place_id="new-place",
@@ -1393,3 +1695,56 @@ def test_refresh_notification_failure_keeps_confirmation_confirmed(monkeypatch, 
     assert db.get_pending_restaurant_confirmation(conn, token)["status"] == "confirmed"
     assert db.get_restaurant(conn, restaurant_id).address == "123 Bay St"
     assert client.ephemeral
+
+
+def test_add_confirmation_notification_failure_keeps_committed_state(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr("slack_bolt.App", _FakeBoltApp)
+    monkeypatch.setattr(
+        "lunch_bot.discovery.validate_suggestion",
+        lambda _config, _name, _location=None: Restaurant(
+            name="New Restaurant",
+            place_id="new-restaurant",
+            lat=43.65,
+            lng=-79.39,
+        ),
+    )
+    config = load_config(
+        env={"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_CHANNEL_ID": "C_TEST"},
+        load_dotenv=False,
+        config_path="__none__.yaml",
+    )
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    app = build_app(
+        config,
+        conn,
+        llm=_FixedRouter(
+            MentionCommand("add_to_pool", queries=["New Restaurant"])
+        ),
+    )
+    client = _FailingUpdateClient()
+    app.events["app_mention"](
+        event={"channel": "C_TEST", "user": "U_MEMBER", "text": "add restaurant"},
+        say=lambda _message: None,
+        client=client,
+    )
+    token = client.posts[0]["blocks"][2]["elements"][0]["value"]
+    actions = {pattern: handler for pattern, handler in app.actions if isinstance(pattern, str)}
+
+    actions["restaurant_confirm"](
+        ack=lambda: None,
+        body={
+            "actions": [{"value": token}],
+            "user": {"id": "U_MEMBER"},
+            "channel": {"id": "C_TEST"},
+            "container": {"message_ts": "1700000000.000902"},
+        },
+        client=client,
+    )
+
+    assert [restaurant.name for restaurant in db.get_active_restaurants(conn)] == [
+        "New Restaurant"
+    ]
+    assert db.get_pending_restaurant_confirmation(conn, token)["status"] == "confirmed"
+    assert "Confirmed and added" in client.ephemeral[0]["text"]
