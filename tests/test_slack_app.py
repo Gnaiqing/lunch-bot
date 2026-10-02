@@ -3,6 +3,7 @@
 from lunch_bot import db
 from lunch_bot.commands import MentionCommand, parse_mention_command
 from lunch_bot.config import load_config
+from lunch_bot.discovery import NearbyRecommendation
 from lunch_bot.models import Restaurant
 from lunch_bot.slack_app import build_app
 
@@ -189,6 +190,55 @@ def test_location_question_returns_stored_address_and_maps_link(monkeypatch, tmp
 
     assert "1235 Bay St., Toronto" in replies[0]
     assert "<https://maps.example/miznon|Open in Google Maps>" in replies[0]
+
+
+def test_explore_restaurants_lists_only_without_persisting(monkeypatch, tmp_path):
+    monkeypatch.setattr("slack_bolt.App", _FakeBoltApp)
+    monkeypatch.setattr(
+        "lunch_bot.discovery.explore_nearby_restaurants",
+        lambda _config, existing, limit: [
+            NearbyRecommendation(
+                restaurant=Restaurant(
+                    name="New Place",
+                    address="10 New St",
+                    place_id="new-place",
+                    maps_url="https://maps.example/new-place",
+                    price_level=2,
+                ),
+                rating=4.6,
+                rating_count=321,
+                distance_m=1_250,
+            )
+        ],
+    )
+    config = load_config(
+        env={"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_CHANNEL_ID": "C_TEST"},
+        load_dotenv=False,
+        config_path="__none__.yaml",
+    )
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    db.upsert_restaurant(conn, Restaurant(name="Existing Place"))
+    app = build_app(
+        config,
+        conn,
+        llm=_FixedRouter(MentionCommand("explore_restaurants", count=7)),
+    )
+    replies = []
+
+    app.events["app_mention"](
+        event={"channel": "C_TEST", "user": "U_MEMBER", "text": "explore restaurants"},
+        say=replies.append,
+        client=_FakeSlackClient(),
+    )
+
+    assert "New Place" in replies[0]
+    assert "4.6/5 from 321 ratings" in replies[0]
+    assert "price level 2/4" in replies[0]
+    assert "1.2 km away" in replies[0]
+    assert "nothing was added" in replies[0].casefold()
+    assert [restaurant.name for restaurant in db.get_active_restaurants(conn)] == [
+        "Existing Place"
+    ]
 
 
 def test_new_restaurant_is_only_added_after_requester_confirms(monkeypatch, tmp_path):

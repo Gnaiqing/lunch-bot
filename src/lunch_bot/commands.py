@@ -27,6 +27,7 @@ COMMAND_KINDS = frozenset(
     {
         "help",
         "list_restaurants",
+        "explore_restaurants",
         "list_poll",
         "restaurant_location",
         "create_poll",
@@ -221,11 +222,12 @@ def _removal_entities(value: str) -> tuple[list[str], list[str]]:
 
 
 def _extract_count(text: str) -> int | None:
-    match = re.search(r"\b(\d+)\s*(?:choices?|options?|restaurants?)\b", text, re.I)
+    counted_item = r"(?:(?:new|nearby)\s+)*(?:choices?|options?|restaurants?)"
+    match = re.search(r"\b(\d+)\s*" + counted_item + r"\b", text, re.I)
     if match:
         return int(match.group(1))
     match = re.search(
-        r"\b(" + "|".join(_NUMBER_WORDS) + r")\s+(?:choices?|options?|restaurants?)\b",
+        r"\b(" + "|".join(_NUMBER_WORDS) + r")\s+" + counted_item + r"\b",
         text,
         re.I,
     )
@@ -346,6 +348,13 @@ def parse_mention_command(text: str) -> MentionCommand:
         lowered,
     ):
         return MentionCommand("send_order_reminder")
+
+    if re.search(
+        r"\b(?:explore|discover|find|recommend|suggest|show)\b.*"
+        r"\b(?:new|nearby|new nearby)\s+restaurants?\b",
+        lowered,
+    ) or re.search(r"\brestaurants?\s+(?:nearby|near the office)\b", lowered):
+        return MentionCommand("explore_restaurants", count=_extract_count(text))
 
     if re.search(r"\b(list|show|what|which)\b.*\b(restaurants?|candidates?|pool)\b", lowered) and not re.search(
         _POLL, lowered

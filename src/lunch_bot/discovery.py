@@ -17,7 +17,10 @@ list (CSV) to bootstrap the pool before the first Nearby Search runs.
 from __future__ import annotations
 
 import math
-from typing import Optional
+import re
+import time
+from dataclasses import dataclass
+from typing import Iterable, Optional
 from urllib.parse import urlencode
 
 from .config import Config
@@ -33,6 +36,19 @@ FOOD_PLACE_TYPES = {
     "meal_takeaway",
     "restaurant",
 }
+EXPLORATION_RADIUS_M = 5_000
+EXPLORATION_MAX_PRICE_LEVEL = 2
+EXPLORATION_MIN_RATING = 3.0
+
+
+@dataclass(frozen=True)
+class NearbyRecommendation:
+    """A read-only nearby discovery result with its selection evidence."""
+
+    restaurant: Restaurant
+    rating: float
+    rating_count: int
+    distance_m: float
 
 
 def _distance_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -122,6 +138,116 @@ def nearby_restaurants(config: Config, *, lat: Optional[float] = None, lng: Opti
             )
         )
     return found
+
+
+def _normalized_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+
+
+def _nearby_search_pages(gmaps, lat: float, lng: float):
+    """Yield up to three legacy Nearby Search pages.
+
+    Google can take a moment to activate a next-page token. Retry that specific
+    transient response briefly; later-page failures leave already collected
+    results usable instead of failing the whole exploration request.
+    """
+    response = gmaps.places_nearby(
+        location=(lat, lng),
+        radius=EXPLORATION_RADIUS_M,
+        type="restaurant",
+        min_price=0,
+        max_price=EXPLORATION_MAX_PRICE_LEVEL,
+    )
+    for _page_number in range(3):
+        yield response
+        page_token = response.get("next_page_token")
+        if not page_token:
+            return
+        response = None
+        for attempt in range(3):
+            if attempt:
+                time.sleep(2)
+            try:
+                candidate = gmaps.places_nearby(page_token=page_token)
+            except Exception:  # pragma: no cover - provider/network best-effort
+                candidate = None
+            if candidate and candidate.get("status") != "INVALID_REQUEST":
+                response = candidate
+                break
+        if response is None:
+            return
+
+
+def explore_nearby_restaurants(
+    config: Config,
+    existing_restaurants: Iterable[Restaurant],
+    *,
+    limit: int = 10,
+) -> list[NearbyRecommendation]:
+    """Return highly rated, affordable nearby restaurants absent from the DB.
+
+    This is deliberately read-only. Results must be strictly within 5 km, have
+    a known Google price level no higher than 2, and have a rating above 3.0.
+    Existing rows are excluded by Place ID and normalized name, including
+    inactive rows, so a previously removed place is not silently resurfaced.
+    """
+    config.require("google_maps_api_key")
+    limit = max(5, min(limit, 10))
+    lat, lng = geocode_office(config)
+    existing = list(existing_restaurants)
+    existing_place_ids = {
+        restaurant.place_id for restaurant in existing if restaurant.place_id
+    }
+    existing_names = {_normalized_name(restaurant.name) for restaurant in existing}
+    recommendations: dict[str, NearbyRecommendation] = {}
+
+    for response in _nearby_search_pages(_client(config.google_maps_api_key), lat, lng):
+        for place in response.get("results", []):
+            place_types = set(place.get("types", []))
+            if "restaurant" not in place_types or "lodging" in place_types:
+                continue
+            if place.get("business_status") in {"CLOSED_TEMPORARILY", "CLOSED_PERMANENTLY"}:
+                continue
+            place_id = place.get("place_id")
+            name = place.get("name", "Unknown")
+            if place_id in existing_place_ids or _normalized_name(name) in existing_names:
+                continue
+            price_level = place.get("price_level")
+            if price_level is None or price_level > EXPLORATION_MAX_PRICE_LEVEL:
+                continue
+            rating = place.get("rating")
+            if rating is None or float(rating) <= EXPLORATION_MIN_RATING:
+                continue
+            geometry = place.get("geometry", {}).get("location", {})
+            place_lat = geometry.get("lat")
+            place_lng = geometry.get("lng")
+            if place_lat is None or place_lng is None:
+                continue
+            distance_m = _distance_m(lat, lng, place_lat, place_lng)
+            if distance_m > EXPLORATION_RADIUS_M:
+                continue
+            key = place_id or _normalized_name(name)
+            recommendations[key] = NearbyRecommendation(
+                restaurant=Restaurant(
+                    name=name,
+                    address=place.get("vicinity") or place.get("formatted_address"),
+                    place_id=place_id,
+                    lat=place_lat,
+                    lng=place_lng,
+                    maps_url=google_maps_url(name, place_id),
+                    price_level=price_level,
+                    source="places",
+                ),
+                rating=float(rating),
+                rating_count=int(place.get("user_ratings_total") or 0),
+                distance_m=distance_m,
+            )
+
+    ranked = sorted(
+        recommendations.values(),
+        key=lambda result: (-result.rating, -result.rating_count, result.distance_m),
+    )
+    return ranked[:limit]
 
 
 def lookup_restaurant(

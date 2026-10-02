@@ -1,7 +1,8 @@
 """Network-free validation tests for suggested Google Places results."""
 
 from lunch_bot.config import load_config
-from lunch_bot.discovery import validate_suggestion
+from lunch_bot.discovery import explore_nearby_restaurants, validate_suggestion
+from lunch_bot.models import Restaurant
 
 
 class _PlacesClient:
@@ -10,6 +11,10 @@ class _PlacesClient:
         self.kwargs = None
 
     def places(self, **kwargs):
+        self.kwargs = kwargs
+        return {"results": self.results}
+
+    def places_nearby(self, **kwargs):
         self.kwargs = kwargs
         return {"results": self.results}
 
@@ -75,3 +80,52 @@ def test_later_valid_place_is_used_when_first_result_is_invalid(monkeypatch):
     assert restaurant is not None
     assert restaurant.name == "Actual Restaurant"
     assert restaurant.place_id == "restaurant-2"
+
+
+def test_explore_nearby_filters_existing_and_criteria_then_ranks(monkeypatch):
+    existing = _place(types=["restaurant"], lat=43.658, lng=-79.388)
+    existing.update(name="Already Listed", place_id="existing", rating=4.9)
+    good = _place(types=["restaurant", "food"], lat=43.66, lng=-79.39)
+    good.update(
+        name="Great New Place",
+        place_id="great",
+        rating=4.7,
+        user_ratings_total=250,
+        price_level=2,
+        vicinity="10 New St",
+    )
+    lower_rated = _place(types=["restaurant"], lat=43.659, lng=-79.389)
+    lower_rated.update(
+        name="Good New Place",
+        place_id="good",
+        rating=4.1,
+        user_ratings_total=500,
+        price_level=1,
+    )
+    invalid_results = [
+        {**_place(types=["restaurant"]), "name": "No Rating", "rating": None},
+        {**_place(types=["restaurant"]), "name": "Too Expensive", "rating": 4.8, "price_level": 3},
+        {**_place(types=["restaurant"], lat=44.0), "name": "Too Far", "rating": 4.8},
+        {**_place(types=["lodging", "restaurant"]), "name": "Hotel", "rating": 4.8},
+        {**_place(types=["restaurant"]), "name": "Low Rating", "rating": 3.0},
+    ]
+    client = _PlacesClient([existing, lower_rated, *invalid_results, good])
+    monkeypatch.setattr("lunch_bot.discovery._client", lambda _key: client)
+    monkeypatch.setattr(
+        "lunch_bot.discovery.geocode_office", lambda _config: (43.6579, -79.3883)
+    )
+
+    results = explore_nearby_restaurants(
+        _config(),
+        [Restaurant(name="Already Listed", place_id="existing", active=False)],
+        limit=10,
+    )
+
+    assert [result.restaurant.name for result in results] == [
+        "Great New Place",
+        "Good New Place",
+    ]
+    assert results[0].restaurant.address == "10 New St"
+    assert results[0].rating == 4.7
+    assert client.kwargs["radius"] == 5000
+    assert client.kwargs["max_price"] == 2

@@ -47,6 +47,7 @@ Commands are conversational and accept either `poll` or `polly`:
 ```text
 @lunch-bot help
 @lunch-bot show current restaurants
+@lunch-bot explore 10 nearby restaurants
 @lunch-bot add Pai Northern Thai to the candidate list
 @lunch-bot create a poll with 4 choices
 @lunch-bot create a poll with 4 choices including Pala 148
@@ -67,12 +68,19 @@ Commands are conversational and accept either `poll` or `polly`:
 @lunch-bot where is Miznon? Can you provide its Google Maps link?
 ```
 
-Conversational poll creation refuses to replace an already-open poll, preserving
-its choices and votes. The weekly scheduler still reconciles stale polls before
-posting a new week's poll. Adding a named restaurant first uses the existing
-candidate pool; if it is not present, the bot validates it
+Poll creation refuses to replace an already-open poll, preserving its choices
+and votes; the database enforces one open poll per channel. Adding a named
+restaurant first uses the existing candidate pool; if it is not present, the bot validates it
 through Google Places and adds it. A cuisine request such as “pizza restaurant”
 selects a matching candidate that is not already in the poll.
+
+The read-only `explore` command searches Google Places for up to 5–10 restaurants
+that are not already present in the database, including inactive entries. It
+requires the Google `restaurant` type, rejects lodging/hotels, verifies an actual
+distance of at most 5 km from the configured office, requires a rating above 3.0,
+and requires a known Google price level of 0–2. Google does not provide a precise
+average meal price in this response, so price level 0–2 is used as the approximate
+proxy for the ~$30/person target. Exploration never adds its results automatically.
 
 Everyone may add restaurants to either collection. Adding a restaurant to the
 current poll also keeps it in the reusable candidate list. Only Slack users in

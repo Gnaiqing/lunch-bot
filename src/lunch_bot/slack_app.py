@@ -280,6 +280,50 @@ def build_app(config: Config, conn, llm=None):
         lines.extend(f"• *{cuisine}:* {', '.join(names)}" for cuisine, names in grouped.items())
         return "\n".join(lines)
 
+    def explore_restaurants_text(command: MentionCommand) -> str:
+        from .discovery import explore_nearby_restaurants
+
+        requested_count = command.count or 10
+        limit = max(5, min(requested_count, 10))
+        existing = db.get_active_restaurants(conn) + db.get_inactive_restaurants(conn)
+        try:
+            results = explore_nearby_restaurants(
+                config,
+                existing,
+                limit=limit,
+            )
+        except Exception as exc:  # pragma: no cover - provider/network best-effort
+            return f"I couldn't explore Google Places right now: {exc}"
+        if not results:
+            return (
+                "I couldn't find any new restaurants matching all criteria: within 5 km, "
+                "Google rating above 3.0, and known price level 0–2."
+            )
+        lines = [
+            f"*Nearby restaurants to explore ({len(results)}):*",
+            "Not currently in the candidate database; nothing was added. "
+            "Google price level 0–2 is an approximate proxy for the ~$30/person target.",
+        ]
+        for result in results:
+            restaurant = result.restaurant
+            distance_km = result.distance_m / 1_000
+            rating_count = (
+                f" from {result.rating_count:,} ratings"
+                if result.rating_count
+                else ""
+            )
+            lines.append(
+                f"• *<{restaurant.maps_url}|{restaurant.name}>* — "
+                f"{result.rating:.1f}/5{rating_count}; "
+                f"price level {restaurant.price_level}/4; {distance_km:.1f} km away"
+                + (f"\n  {restaurant.address}" if restaurant.address else "")
+            )
+        if len(results) < limit:
+            lines.append(
+                f"Only {len(results)} restaurant(s) matched every criterion in the available results."
+            )
+        return "\n".join(lines)
+
     def current_poll_text() -> str:
         poll = db.get_open_poll(conn, config.slack_channel_id)
         if poll is None:
@@ -872,6 +916,7 @@ def build_app(config: Config, conn, llm=None):
             say(
                 "I manage our lunch candidate pool and multi-select polls. Try:\n"
                 "• `@lunch-bot show current restaurants`\n"
+                "• `@lunch-bot explore 10 nearby restaurants`\n"
                 "• `@lunch-bot add Pai Northern Thai to the candidate list`\n"
                 "• `@lunch-bot create a poll with 4 choices`\n"
                 "• `@lunch-bot create a poll with 4 choices including Pala 148`\n"
@@ -885,6 +930,9 @@ def build_app(config: Config, conn, llm=None):
             return
         if command.kind == "list_restaurants":
             say(restaurant_list_text())
+            return
+        if command.kind == "explore_restaurants":
+            say(explore_restaurants_text(command))
             return
         if command.kind == "list_inactive":
             inactive = sorted(db.get_inactive_restaurants(conn), key=lambda r: r.name.casefold())

@@ -112,6 +112,18 @@ def test_manual_order_reminder_command():
     assert command.kind == "send_order_reminder"
 
 
+def test_explore_nearby_restaurants_is_read_only():
+    command = parse_mention_command("explore 7 nearby restaurants")
+    assert command.kind == "explore_restaurants"
+    assert command.count == 7
+
+    routed = parse_semantic_route(
+        _route(intent="explore_restaurants", mode="answer", count=10)
+    )
+    assert routed.kind == "explore_restaurants"
+    assert routed.count == 10
+
+
 def test_match_restaurant_name_before_cuisine():
     pool = [
         Restaurant(id=1, name="Pala 148", cuisine="Pizza"),
