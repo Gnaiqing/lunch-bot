@@ -1,5 +1,7 @@
 """Network-free integration tests for conversational Slack mention handling."""
 
+import json
+
 from lunch_bot import db
 from lunch_bot.commands import MentionCommand, parse_mention_command
 from lunch_bot.config import load_config
@@ -50,6 +52,11 @@ class _FakeSlackClient:
 class _FailingUpdateClient(_FakeSlackClient):
     def chat_update(self, **kwargs):
         raise RuntimeError("Slack update failed")
+
+
+class _FailingPostClient(_FakeSlackClient):
+    def chat_postMessage(self, **kwargs):
+        raise RuntimeError("Slack post failed")
 
 
 class _RoutingLLM:
@@ -406,6 +413,65 @@ def test_new_poll_choice_waits_for_confirmation_before_database_and_poll(monkeyp
     assert db.get_pending_restaurant_confirmation(conn, token)["status"] == "confirmed"
 
 
+def test_confirmed_choice_rolls_back_if_poll_message_becomes_unavailable(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr("slack_bolt.App", _FakeBoltApp)
+    monkeypatch.setattr(
+        "lunch_bot.discovery.validate_suggestion",
+        lambda _config, _name, _location=None: Restaurant(
+            name="New Lunch Spot",
+            place_id="new-lunch-place",
+            lat=43.66,
+            lng=-79.39,
+            price_level=1,
+        ),
+    )
+    config = load_config(
+        env={"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_CHANNEL_ID": "C_TEST"},
+        load_dotenv=False,
+        config_path="__none__.yaml",
+    )
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    existing_id = db.upsert_restaurant(conn, Restaurant(name="Existing"))
+    poll_id = db.create_poll(conn, "C_TEST", [existing_id])
+    db.set_poll_ts(conn, poll_id, "1700000000.000010")
+    app = build_app(config, conn, llm=_RoutingLLM())
+    client = _FakeSlackClient()
+    app.events["app_mention"](
+        event={
+            "channel": "C_TEST",
+            "user": "U_REQUESTER",
+            "text": "add New Lunch Spot to this week's poll",
+        },
+        say=lambda _message: None,
+        client=client,
+    )
+    token = client.posts[0]["blocks"][2]["elements"][0]["value"]
+
+    # Simulate the poll losing its Slack message after the confirmation card was
+    # posted but before the requester clicked Confirm.
+    db.set_poll_ts(conn, poll_id, None)
+    actions = {pattern: handler for pattern, handler in app.actions if isinstance(pattern, str)}
+    actions["restaurant_confirm"](
+        ack=lambda: None,
+        body={
+            "actions": [{"value": token}],
+            "user": {"id": "U_REQUESTER"},
+            "channel": {"id": "C_TEST"},
+            "container": {"message_ts": "1700000000.000020"},
+        },
+        client=client,
+    )
+
+    assert db.get_poll_option_ids(conn, poll_id) == [existing_id]
+    assert db.get_pending_restaurant_confirmation(conn, token)["status"] == "confirmed"
+    assert any(
+        restaurant.name == "New Lunch Spot"
+        for restaurant in db.get_active_restaurants(conn)
+    )
+
+
 def test_add_existing_choice_preserves_poll_options_votes_and_message(monkeypatch, tmp_path):
     monkeypatch.setattr("slack_bolt.App", _FakeBoltApp)
     config = load_config(
@@ -722,6 +788,16 @@ def test_manager_removes_category_from_pool_and_open_poll(monkeypatch, tmp_path)
         keep_id,
     ]
     token = client.posts[0]["blocks"][1]["elements"][0]["value"]
+    pending_payload = json.loads(db.get_pending_manager_action(conn, token)["payload"])
+    assert pending_payload["target_ids"] == other_ids
+    assert pending_payload["poll_id"] == poll_id
+
+    # The confirmation must apply the exact IDs displayed on the card, not
+    # re-run the category query against this changed live state.
+    db.rename_restaurant(conn, other_ids[0], "Renamed Hotel")
+    newly_matching_id = db.upsert_restaurant(
+        conn, Restaurant(name="Hotel Added Later", cuisine="other")
+    )
     actions = {pattern: handler for pattern, handler in app.actions if isinstance(pattern, str)}
     actions["manager_action_confirm"](
         ack=lambda: None,
@@ -734,11 +810,49 @@ def test_manager_removes_category_from_pool_and_open_poll(monkeypatch, tmp_path)
         client=client,
     )
 
-    assert [restaurant.id for restaurant in db.get_active_restaurants(conn)] == [keep_id]
+    assert [restaurant.id for restaurant in db.get_active_restaurants(conn)] == [
+        keep_id,
+        newly_matching_id,
+    ]
     assert db.get_poll_option_ids(conn, poll_id) == [keep_id]
     assert db.tally_votes(conn, poll_id) == {}
     assert len(client.updates) == 2
     assert "Nothing has changed yet" in replies[0]
+
+
+def test_failed_bulk_confirmation_post_marks_action_failed(monkeypatch, tmp_path):
+    monkeypatch.setattr("slack_bolt.App", _FakeBoltApp)
+    config = load_config(
+        env={
+            "SLACK_BOT_TOKEN": "xoxb-test",
+            "SLACK_CHANNEL_ID": "C_TEST",
+            "SLACK_MANAGER_USER_IDS": "U_MANAGER",
+        },
+        load_dotenv=False,
+        config_path="__none__.yaml",
+    )
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    ids = [
+        db.upsert_restaurant(conn, Restaurant(name=f"Hotel {index}", cuisine="other"))
+        for index in range(2)
+    ]
+    app = build_app(
+        config,
+        conn,
+        llm=_FixedRouter(MentionCommand("remove_from_pool", cuisines=["other"])),
+    )
+    replies = []
+
+    app.events["app_mention"](
+        event={"channel": "C_TEST", "user": "U_MANAGER", "text": "remove other"},
+        say=replies.append,
+        client=_FailingPostClient(),
+    )
+
+    pending = conn.execute("SELECT * FROM pending_manager_actions").fetchone()
+    assert pending["status"] == "failed"
+    assert [restaurant.id for restaurant in db.get_active_restaurants(conn)] == ids
+    assert "couldn't post the confirmation card" in replies[0]
 
 
 def test_router_failure_uses_safe_read_only_fallback(monkeypatch, tmp_path):

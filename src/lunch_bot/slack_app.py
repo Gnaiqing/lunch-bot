@@ -539,7 +539,13 @@ def build_app(config: Config, conn, llm=None):
         say(message)
 
     def request_bulk_confirmation(
-        command: MentionCommand, event: dict, client, targets: list[Restaurant], *, from_pool: bool
+        command: MentionCommand,
+        event: dict,
+        client,
+        targets: list[Restaurant],
+        *,
+        from_pool: bool,
+        poll_id: int | None,
     ) -> bool:
         token = uuid.uuid4().hex
         payload = json.dumps(
@@ -548,6 +554,8 @@ def build_app(config: Config, conn, llm=None):
                 "queries": command.queries,
                 "cuisines": command.cuisines,
                 "from_pool": from_pool,
+                "target_ids": [restaurant.id for restaurant in targets],
+                "poll_id": poll_id,
             }
         )
         db.create_pending_manager_action(
@@ -559,37 +567,41 @@ def build_app(config: Config, conn, llm=None):
             payload=payload,
         )
         names = ", ".join(restaurant.name for restaurant in targets)
-        client.chat_postMessage(
-            channel=event.get("channel"),
-            text=f"Confirm removal of {len(targets)} restaurants: {names}",
-            blocks=[
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"This will remove *{len(targets)}* restaurants:\n{names}",
+        try:
+            client.chat_postMessage(
+                channel=event.get("channel"),
+                text=f"Confirm removal of {len(targets)} restaurants: {names}",
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"This will remove *{len(targets)}* restaurants:\n{names}",
+                        },
                     },
-                },
-                {
-                    "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "style": "danger",
-                            "text": {"type": "plain_text", "text": "Confirm removal"},
-                            "action_id": "manager_action_confirm",
-                            "value": token,
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Cancel"},
-                            "action_id": "manager_action_cancel",
-                            "value": token,
-                        },
-                    ],
-                },
-            ],
-        )
+                    {
+                        "type": "actions",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "style": "danger",
+                                "text": {"type": "plain_text", "text": "Confirm removal"},
+                                "action_id": "manager_action_confirm",
+                                "value": token,
+                            },
+                            {
+                                "type": "button",
+                                "text": {"type": "plain_text", "text": "Cancel"},
+                                "action_id": "manager_action_cancel",
+                                "value": token,
+                            },
+                        ],
+                    },
+                ],
+            )
+        except Exception:  # pragma: no cover - Slack network best-effort
+            db.resolve_pending_manager_action(conn, token, "failed")
+            return False
         return True
 
     def handle_remove(
@@ -600,8 +612,15 @@ def build_app(config: Config, conn, llm=None):
         *,
         from_pool: bool,
         confirmed: bool = False,
+        confirmed_target_ids: list[int] | None = None,
+        confirmed_poll_id: int | None = None,
     ) -> None:
-        poll = db.get_open_poll(conn, config.slack_channel_id)
+        if not from_pool and confirmed_poll_id is not None:
+            poll = db.get_poll(conn, confirmed_poll_id)
+            if poll is not None and poll["status"] != "open":
+                poll = None
+        else:
+            poll = db.get_open_poll(conn, config.slack_channel_id)
         poll_option_ids = set(db.get_poll_option_ids(conn, poll["id"])) if poll else set()
 
         if from_pool:
@@ -618,13 +637,38 @@ def build_app(config: Config, conn, llm=None):
             ]
             collection_name = "current poll"
 
-        targets, failures = removal_targets(collection, command)
+        if confirmed_target_ids is None:
+            targets, failures = removal_targets(collection, command)
+        else:
+            targets = [
+                restaurant
+                for restaurant_id in confirmed_target_ids
+                if (restaurant := db.get_restaurant(conn, restaurant_id)) is not None
+                and (from_pool or restaurant_id in poll_option_ids)
+            ]
+            missing_count = len(confirmed_target_ids) - len(targets)
+            failures = (
+                [f"{missing_count} approved item(s) were no longer available."]
+                if missing_count
+                else []
+            )
         if not targets:
             say("\n".join(failures) if failures else "No matching restaurants were removed.")
             return
         if len(targets) > 1 and not confirmed:
-            request_bulk_confirmation(command, event, client, targets, from_pool=from_pool)
-            say("Please confirm the bulk removal using the card above. Nothing has changed yet.")
+            requested = request_bulk_confirmation(
+                command,
+                event,
+                client,
+                targets,
+                from_pool=from_pool,
+                poll_id=poll["id"] if poll is not None else None,
+            )
+            say(
+                "Please confirm the bulk removal using the card above. Nothing has changed yet."
+                if requested
+                else "I couldn't post the confirmation card, so nothing was changed."
+            )
             return
 
         target_ids = {restaurant.id for restaurant in targets}
@@ -1116,6 +1160,8 @@ def build_app(config: Config, conn, llm=None):
                 client,
                 from_pool=bool(payload["from_pool"]),
                 confirmed=True,
+                confirmed_target_ids=payload.get("target_ids"),
+                confirmed_poll_id=payload.get("poll_id"),
             )
             db.resolve_pending_manager_action(conn, token, "confirmed")
         except Exception:
@@ -1231,6 +1277,10 @@ def build_app(config: Config, conn, llm=None):
                         poll_added = updated
                         if poll_added:
                             db.increment_selection_counts(conn, [restaurant.id])
+                        else:
+                            db.remove_poll_option(
+                                conn, claimed["poll_id"], restaurant.id
+                            )
             db.resolve_pending_restaurant_confirmation(conn, token, "confirmed")
         except Exception:
             db.resolve_pending_restaurant_confirmation(conn, token, "failed")

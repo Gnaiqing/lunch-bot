@@ -590,6 +590,12 @@ def resolve_pending_manager_action(conn, token: str, status: str) -> None:
         conn.commit()
 
 
+def get_pending_manager_action(conn, token: str):
+    return conn.execute(
+        "SELECT * FROM pending_manager_actions WHERE token = ?", (token,)
+    ).fetchone()
+
+
 def get_pending_restaurant_confirmation(
     conn: sqlite3.Connection, token: str
 ) -> Optional[sqlite3.Row]:
@@ -661,6 +667,18 @@ def create_poll(
     option_ids = list(option_restaurant_ids)
     with _write_lock:
         try:
+            # Reserve the channel in the same database transaction as creation.
+            # BEGIN IMMEDIATE serializes this check across multiple bot processes;
+            # the partial unique index installed at startup is a second backstop.
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT 1 FROM polls WHERE slack_channel = ? AND status = 'open'",
+                (slack_channel,),
+            ).fetchone()
+            if existing is not None:
+                raise PollAlreadyOpenError(
+                    f"Channel {slack_channel!r} already has an open poll."
+                )
             cur = conn.execute(
                 "INSERT INTO polls (slack_channel, created_at, closes_at, status) VALUES (?, ?, ?, 'open')",
                 (slack_channel, now, closes_at),
