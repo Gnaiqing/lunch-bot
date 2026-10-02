@@ -78,46 +78,49 @@ def create_weekly_poll(
     # Create the poll row + options (needed to build the option action_ids) but do
     # NOT consume the selection yet: times_selected is incremented only once the
     # poll has actually been posted, so a failed Slack post leaves no trace.
-    try:
-        poll_id = db.create_poll(
-            conn,
-            config.slack_channel_id,
-            option_ids,
-            closes_at=closes_at,
-            increment_selection=False,
-        )
-    except db.PollAlreadyOpenError:
-        # The database constraint makes this check atomic with creation. In
-        # particular, a second Slack request must not close or post over the poll
-        # that won the race.
-        logger.warning(
-            "Skipped poll creation because channel %s already has an open poll.",
-            config.slack_channel_id,
-        )
-        return None
+    with polls.POLL_MESSAGE_LOCK:
+        try:
+            poll_id = db.create_poll(
+                conn,
+                config.slack_channel_id,
+                option_ids,
+                closes_at=closes_at,
+                increment_selection=False,
+            )
+        except db.PollAlreadyOpenError:
+            # The database constraint makes this check atomic with creation. In
+            # particular, a second Slack request must not close or post over the poll
+            # that won the race.
+            logger.warning(
+                "Skipped poll creation because channel %s already has an open poll.",
+                config.slack_channel_id,
+            )
+            return None
 
-    blocks = polls.build_poll_blocks(poll_id, candidates)
-    try:
-        resp = client.chat_postMessage(
-            channel=config.slack_channel_id,
-            blocks=blocks,
-            text="This week's lunch poll is up!",
-        )
-    except Exception as exc:
-        # Post failed: roll back the poll so no open poll with no Slack ts is left
-        # behind (the close job would otherwise close an orphan), and do NOT
-        # increment times_selected.
-        db.delete_poll(conn, poll_id)
-        logger.error("Failed to post weekly poll %s; rolled it back (%s).", poll_id, exc)
-        return None
+        blocks = polls.build_poll_blocks(poll_id, candidates)
+        try:
+            resp = client.chat_postMessage(
+                channel=config.slack_channel_id,
+                blocks=blocks,
+                text="This week's lunch poll is up!",
+            )
+        except Exception as exc:
+            # Post failed: roll back the poll so no open poll with no Slack ts is left
+            # behind (the close job would otherwise close an orphan), and do NOT
+            # increment times_selected.
+            db.delete_poll(conn, poll_id)
+            logger.error(
+                "Failed to post weekly poll %s; rolled it back (%s).", poll_id, exc
+            )
+            return None
 
-    ts = resp.get("ts")
-    if ts:
-        db.set_poll_ts(conn, poll_id, ts)
-    # Only now that the poll is live do we consume the selection.
-    db.increment_selection_counts(conn, option_ids)
-    logger.info("Posted weekly poll %s with %d options", poll_id, len(candidates))
-    return poll_id
+        ts = resp.get("ts")
+        if ts:
+            db.set_poll_ts(conn, poll_id, ts)
+        # Only now that the poll is live do we consume the selection.
+        db.increment_selection_counts(conn, option_ids)
+        logger.info("Posted weekly poll %s with %d options", poll_id, len(candidates))
+        return poll_id
 
 
 def close_poll_and_announce(

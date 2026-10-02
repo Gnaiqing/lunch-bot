@@ -401,6 +401,35 @@ def build_app(config: Config, conn, llm=None):
             )
             return True
 
+    def add_poll_options_and_update(
+        poll_id: int, restaurant_ids: list[int], client
+    ) -> tuple[list[int], list[int], bool]:
+        with polls.POLL_MESSAGE_LOCK:
+            added_ids = []
+            rejected_ids = []
+            try:
+                for restaurant_id in restaurant_ids:
+                    if db.add_poll_option_if_open(
+                        conn,
+                        poll_id,
+                        restaurant_id,
+                        max_options=config.max_poll_options,
+                    ):
+                        added_ids.append(restaurant_id)
+                    else:
+                        rejected_ids.append(restaurant_id)
+                if not added_ids:
+                    return added_ids, rejected_ids, False
+                updated = update_poll_message(poll_id, client)
+            except Exception:
+                for restaurant_id in added_ids:
+                    db.remove_poll_option(conn, poll_id, restaurant_id)
+                raise
+            if not updated:
+                for restaurant_id in added_ids:
+                    db.remove_poll_option(conn, poll_id, restaurant_id)
+            return added_ids, rejected_ids, updated
+
     def handle_create_poll(command: MentionCommand, event, say, client) -> None:
         if command.count is not None:
             count = command.count
@@ -481,17 +510,22 @@ def build_app(config: Config, conn, llm=None):
             return
 
         existing_ids = set(db.get_poll_option_ids(conn, poll["id"]))
-        added_ids: list[int] = []
+        pending_additions: list[Restaurant] = []
         failures: list[str] = []
         entities = [(query, False) for query in command.queries]
         entities.extend((query, True) for query in command.cuisines)
         for query, is_cuisine in entities:
-            if len(existing_ids) + len(added_ids) >= config.max_poll_options:
+            if len(existing_ids) + len(pending_additions) >= config.max_poll_options:
                 failures.append(
                     f"The poll already has the maximum of {config.max_poll_options} choices."
                 )
                 break
-            excluded_ids = existing_ids | set(added_ids)
+            pending_ids = {
+                restaurant.id
+                for restaurant in pending_additions
+                if restaurant.id is not None
+            }
+            excluded_ids = existing_ids | pending_ids
             if not is_cuisine:
                 existing_match, ambiguous = choose_from_pool(query)
                 if ambiguous:
@@ -531,33 +565,34 @@ def build_app(config: Config, conn, llm=None):
                 else:
                     failures.append(error or f"Couldn't resolve '{query}'.")
                 continue
-            if db.add_poll_option_if_open(
-                conn,
-                poll["id"],
-                restaurant.id,
-                max_options=config.max_poll_options,
-            ):
-                added_ids.append(restaurant.id)
-            else:
-                failures.append(f"'{restaurant.name}' is already in the poll or the poll is closed.")
+            pending_additions.append(restaurant)
 
-        if not added_ids:
+        if not pending_additions:
             say("\n".join(failures) if failures else "No new choices were added.")
             return
 
         try:
-            updated = update_poll_message(poll["id"], client)
+            added_ids, rejected_ids, updated = add_poll_options_and_update(
+                poll["id"],
+                [
+                    restaurant.id
+                    for restaurant in pending_additions
+                    if restaurant.id is not None
+                ],
+                client,
+            )
         except Exception as exc:  # pragma: no cover - Slack network best-effort
-            for restaurant_id in added_ids:
-                db.remove_poll_option(conn, poll["id"], restaurant_id)
             say(f"I couldn't update the Slack poll, so I rolled back the new choices: {exc}")
             return
         if not updated:
-            for restaurant_id in added_ids:
-                db.remove_poll_option(conn, poll["id"], restaurant_id)
             say("The poll changed while I was updating it, so I rolled back the new choices.")
             return
 
+        if rejected_ids:
+            failures.append(
+                "Some requested choices were already in the poll, the poll closed, "
+                "or the poll reached its maximum size."
+            )
         db.increment_selection_counts(conn, added_ids)
         names = [db.get_restaurant(conn, restaurant_id).name for restaurant_id in added_ids]
         message = "Added to the current poll: *" + "*, *".join(names) + "*."
@@ -1005,10 +1040,7 @@ def build_app(config: Config, conn, llm=None):
             "merge_restaurants",
             "send_order_reminder",
         } and not is_manager(event.get("user")):
-            say(
-                "Only a configured lunch-bot manager can remove poll choices or candidates, "
-                "or close the current poll."
-            )
+            say("Only a configured lunch-bot manager can perform this action.")
             return
 
         if command.kind == "help":
@@ -1343,26 +1375,11 @@ def build_app(config: Config, conn, llm=None):
             restaurant.id = db.upsert_restaurant(conn, restaurant)
             poll_added = False
             if claimed["target"] == "poll" and claimed["poll_id"] is not None:
-                poll_added = db.add_poll_option_if_open(
-                    conn,
-                    claimed["poll_id"],
-                    restaurant.id,
-                    max_options=config.max_poll_options,
+                added_ids, _rejected_ids, poll_added = add_poll_options_and_update(
+                    claimed["poll_id"], [restaurant.id], client
                 )
                 if poll_added:
-                    try:
-                        updated = update_poll_message(claimed["poll_id"], client)
-                    except Exception:
-                        db.remove_poll_option(conn, claimed["poll_id"], restaurant.id)
-                        poll_added = False
-                    else:
-                        poll_added = updated
-                        if poll_added:
-                            db.increment_selection_counts(conn, [restaurant.id])
-                        else:
-                            db.remove_poll_option(
-                                conn, claimed["poll_id"], restaurant.id
-                            )
+                    db.increment_selection_counts(conn, added_ids)
             db.resolve_pending_restaurant_confirmation(conn, token, "confirmed")
         except Exception:
             db.resolve_pending_restaurant_confirmation(conn, token, "failed")

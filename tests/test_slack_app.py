@@ -1204,6 +1204,85 @@ def test_in_flight_vote_cannot_overwrite_closed_poll_message(monkeypatch, tmp_pa
     )
 
 
+def test_poll_option_insert_render_and_close_are_serialized(monkeypatch, tmp_path):
+    monkeypatch.setattr("slack_bolt.App", _FakeBoltApp)
+    config = load_config(
+        env={"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_CHANNEL_ID": "C_TEST"},
+        load_dotenv=False,
+        config_path="__none__.yaml",
+    )
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    existing_id = db.upsert_restaurant(conn, Restaurant(name="Existing"))
+    added_id = db.upsert_restaurant(
+        conn, Restaurant(name="Pizza Place", cuisine="Pizza")
+    )
+    poll_id = db.create_poll(conn, "C_TEST", [existing_id])
+    db.set_poll_ts(conn, poll_id, "1700000000.000800")
+    original_add = db.add_poll_option_if_open
+    option_inserted = threading.Event()
+    release_insert = threading.Event()
+
+    def block_after_insert(*args, **kwargs):
+        added = original_add(*args, **kwargs)
+        if added:
+            option_inserted.set()
+            assert release_insert.wait(timeout=5)
+        return added
+
+    monkeypatch.setattr(db, "add_poll_option_if_open", block_after_insert)
+    app = build_app(
+        config,
+        conn,
+        llm=_FixedRouter(MentionCommand("add_to_poll", queries=["Pizza Place"])),
+    )
+    client = _FakeSlackClient()
+    add_thread = threading.Thread(
+        target=app.events["app_mention"],
+        kwargs={
+            "event": {
+                "channel": "C_TEST",
+                "user": "U_MEMBER",
+                "text": "add Pizza Place to this week's poll",
+            },
+            "say": lambda _message: None,
+            "client": client,
+        },
+    )
+    add_thread.start()
+    assert option_inserted.wait(timeout=5)
+
+    close_started = threading.Event()
+    close_finished = threading.Event()
+
+    def close_poll():
+        close_started.set()
+        scheduler.close_poll_and_announce(config, conn, client)
+        close_finished.set()
+
+    close_thread = threading.Thread(target=close_poll)
+    close_thread.start()
+    assert close_started.wait(timeout=5)
+    assert not close_finished.wait(timeout=0.1)
+    release_insert.set()
+    add_thread.join(timeout=5)
+    close_thread.join(timeout=5)
+
+    assert not add_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert db.get_poll(conn, poll_id)["status"] == "closed"
+    assert set(db.get_poll_option_ids(conn, poll_id)) == {existing_id, added_id}
+    assert client.updates[-1]["text"] == "Lunch poll closed"
+    assert any(
+        "Pizza Place" in block.get("text", {}).get("text", "")
+        for block in client.updates[-1]["blocks"]
+    )
+    assert all(
+        "accessory" not in block
+        for block in client.updates[-1]["blocks"]
+        if block["type"] == "section"
+    )
+
+
 def test_manager_closes_then_creates_four_choice_poll(monkeypatch, tmp_path):
     monkeypatch.setattr("slack_bolt.App", _FakeBoltApp)
     config = load_config(

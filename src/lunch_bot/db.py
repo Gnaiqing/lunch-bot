@@ -345,7 +345,8 @@ def upsert_restaurant(conn: sqlite3.Connection, r: Restaurant) -> int:
                        place_id = COALESCE(?, place_id),
                        lat = COALESCE(?, lat), lng = COALESCE(?, lng),
                        maps_url = COALESCE(?, maps_url),
-                       price_level = COALESCE(?, price_level), active = ?
+                       price_level = COALESCE(?, price_level),
+                       active = CASE WHEN active = 0 THEN 0 ELSE ? END
                  WHERE id = ?
                 """,
                 (

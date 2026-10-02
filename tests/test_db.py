@@ -80,6 +80,27 @@ def test_soft_remove_and_reactivate_restaurant_preserves_row(tmp_path):
     ]
 
 
+def test_upsert_does_not_reactivate_soft_removed_restaurant(tmp_path):
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    restaurant_id = db.upsert_restaurant(
+        conn, Restaurant(name="Removed Candidate", place_id="removed-place")
+    )
+    db.set_restaurants_active(conn, [restaurant_id], active=False)
+
+    matched_id = db.upsert_restaurant(
+        conn,
+        Restaurant(
+            name="Removed Candidate",
+            place_id="removed-place",
+            address="Updated address",
+        ),
+    )
+
+    assert matched_id == restaurant_id
+    assert db.get_restaurant(conn, restaurant_id).active is False
+    assert db.get_restaurant(conn, restaurant_id).address == "Updated address"
+
+
 def test_merge_restaurants_preserves_poll_votes_and_history(tmp_path):
     conn = db.init_db(str(tmp_path / "lunch.db"))
     source = db.upsert_restaurant(conn, Restaurant(name="Raku duplicate"))

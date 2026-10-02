@@ -9,6 +9,8 @@ Network-free: the Slack client is a stub and the DB is a throwaway sqlite file
   database invariant prevents a competing replacement from being posted.
 """
 
+import threading
+
 from lunch_bot import db, scheduler
 from lunch_bot.config import load_config
 from lunch_bot.models import Restaurant
@@ -55,6 +57,23 @@ class _FailingClient:
     def chat_postMessage(self, **kwargs):
         self.calls += 1
         raise RuntimeError("slack is down")
+
+
+class _BlockingCreateClient(_OkClient):
+    def __init__(self):
+        super().__init__()
+        self.post_started = threading.Event()
+        self.release_post = threading.Event()
+        self.updates = []
+
+    def chat_postMessage(self, **kwargs):
+        if kwargs["text"] == "This week's lunch poll is up!":
+            self.post_started.set()
+            assert self.release_post.wait(timeout=5)
+        return super().chat_postMessage(**kwargs)
+
+    def chat_update(self, **kwargs):
+        self.updates.append(kwargs)
 
 
 def _open_polls(conn, channel="C_TEST"):
@@ -117,6 +136,50 @@ def test_successful_post_opens_one_poll_and_consumes_selection(tmp_path):
     for rid, count in after.items():
         expected = before[rid] + (1 if rid in option_ids else 0)
         assert count == expected
+
+
+def test_poll_cannot_be_closed_before_creation_post_and_timestamp_finish(tmp_path):
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    _seed(conn)
+    config = _config()
+    client = _BlockingCreateClient()
+    created_ids = []
+    create_thread = threading.Thread(
+        target=lambda: created_ids.append(
+            scheduler.create_weekly_poll(config, conn, client)
+        )
+    )
+    create_thread.start()
+    assert client.post_started.wait(timeout=5)
+
+    close_started = threading.Event()
+    close_finished = threading.Event()
+
+    def close_poll():
+        close_started.set()
+        scheduler.close_poll_and_announce(config, conn, client)
+        close_finished.set()
+
+    close_thread = threading.Thread(target=close_poll)
+    close_thread.start()
+    assert close_started.wait(timeout=5)
+    assert not close_finished.wait(timeout=0.1)
+    client.release_post.set()
+    create_thread.join(timeout=5)
+    close_thread.join(timeout=5)
+
+    assert not create_thread.is_alive()
+    assert not close_thread.is_alive()
+    poll_id = created_ids[0]
+    poll = db.get_poll(conn, poll_id)
+    assert poll["status"] == "closed"
+    assert poll["slack_ts"] is not None
+    assert client.updates[-1]["text"] == "Lunch poll closed"
+    assert all(
+        "accessory" not in block
+        for block in client.updates[-1]["blocks"]
+        if block["type"] == "section"
+    )
 
 
 # ---------------------------------------------------------------------------
