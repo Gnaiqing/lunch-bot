@@ -124,7 +124,8 @@ def create_weekly_poll(
 
 
 def close_poll_and_announce(
-    config: Config, conn, client, *, reading_group_time: str | None = None
+    config: Config, conn, client, *, reading_group_time: str | None = None,
+    expected_poll_id: int | None = None,
 ) -> bool:
     """Close the open poll, record votes, announce the winner, and prompt prep.
 
@@ -133,12 +134,17 @@ def close_poll_and_announce(
     memory). Then posts the winner and prompts the ORGANIZER to create + post the
     Uber Eats group-order link (with a suggested search to save a lookup). The
     bot never creates or places the order.
+
+    When ``expected_poll_id`` is supplied, close only that observed poll;
+    a replacement opened by another request must not be closed instead.
     """
     config.require("slack_channel_id")
     with polls.POLL_MESSAGE_LOCK:
         open_poll = db.get_open_poll(conn, config.slack_channel_id)
-        if not open_poll:
-            logger.warning("No open poll to close + announce.")
+        if not open_poll or (
+            expected_poll_id is not None and open_poll["id"] != expected_poll_id
+        ):
+            logger.warning("The expected poll is no longer open; skipping close.")
             return False
         poll_id = open_poll["id"]
 

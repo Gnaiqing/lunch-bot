@@ -848,16 +848,22 @@ def build_app(config: Config, conn, llm=None):
         closed = False
         if open_poll is not None:
             try:
-                closed = close_poll_and_announce(config, conn, client)
+                closed = close_poll_and_announce(
+                    config, conn, client, expected_poll_id=open_poll["id"]
+                )
             except Exception as exc:  # pragma: no cover - Slack network best-effort
                 # Closing/tallying is atomic and may have succeeded before an
                 # announcement call failed. Never reopen it or claim otherwise.
-                closed = db.get_open_poll(conn, config.slack_channel_id) is None
+                observed_poll = db.get_poll(conn, open_poll["id"])
+                closed = observed_poll is not None and observed_poll["status"] == "closed"
                 if closed:
                     say(f"The poll was closed, but I couldn't post its announcement: {exc}")
                 else:
                     say(f"I couldn't close the current poll: {exc}")
                     return
+            if not closed:
+                say("The poll you requested to close is no longer open; this request was already handled.")
+                return
 
         if create_new:
             if open_poll is None:

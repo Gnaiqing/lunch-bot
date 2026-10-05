@@ -3,6 +3,8 @@
 import json
 import threading
 
+import pytest
+
 from lunch_bot import db, polls, scheduler
 from lunch_bot.commands import MentionCommand, parse_mention_command
 from lunch_bot.config import load_config
@@ -1381,6 +1383,88 @@ def test_manager_closes_then_creates_four_choice_poll(monkeypatch, tmp_path):
     assert len(client.updates) == 1
     # One post announces that the old poll had no votes; the other is the new poll.
     assert len(client.posts) == 2
+
+
+@pytest.mark.parametrize("kind", ["close_poll", "close_and_create_poll"])
+def test_stale_close_request_preserves_replacement_poll(monkeypatch, tmp_path, kind):
+    monkeypatch.setattr("slack_bolt.App", _FakeBoltApp)
+    config = load_config(
+        env={
+            "SLACK_BOT_TOKEN": "xoxb-test",
+            "SLACK_CHANNEL_ID": "C_TEST",
+            "SLACK_MANAGER_USER_IDS": "U_MANAGER",
+        },
+        load_dotenv=False,
+        config_path="__none__.yaml",
+    )
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    ids = [db.upsert_restaurant(conn, Restaurant(name=f"Candidate {i}")) for i in range(4)]
+    original_id = db.create_poll(conn, "C_TEST", ids[:2])
+    client = _FakeSlackClient()
+    original_close = scheduler.close_poll_and_announce
+    replacement_ids = []
+
+    def replace_before_close(*args, **kwargs):
+        # Another request completes between the handler's observation and close.
+        assert original_close(config, conn, client, expected_poll_id=original_id)
+        replacement_id = db.create_poll(conn, "C_TEST", ids)
+        db.set_poll_ts(conn, replacement_id, "1700000000.000999")
+        db.record_vote_if_open(conn, replacement_id, ids[0], "U_VOTER")
+        replacement_ids.append(replacement_id)
+        return original_close(*args, **kwargs)
+
+    monkeypatch.setattr(scheduler, "close_poll_and_announce", replace_before_close)
+    app = build_app(config, conn, llm=_FixedRouter(MentionCommand(kind, count=4)))
+    replies = []
+    app.events["app_mention"](
+        event={"channel": "C_TEST", "user": "U_MANAGER", "text": "close poll"},
+        say=replies.append,
+        client=client,
+    )
+
+    replacement_id = replacement_ids[0]
+    assert db.get_open_poll(conn, "C_TEST")["id"] == replacement_id
+    assert db.tally_votes(conn, replacement_id) == {ids[0]: 1}
+    assert conn.execute("SELECT COUNT(*) FROM polls").fetchone()[0] == 2
+    assert client.updates == []
+    assert len(client.posts) == 1  # Only the competing request's close announcement.
+    assert "already handled" in replies[0]
+
+
+def test_close_announcement_failure_checks_observed_poll_status(monkeypatch, tmp_path):
+    monkeypatch.setattr("slack_bolt.App", _FakeBoltApp)
+    config = load_config(
+        env={
+            "SLACK_BOT_TOKEN": "xoxb-test",
+            "SLACK_CHANNEL_ID": "C_TEST",
+            "SLACK_MANAGER_USER_IDS": "U_MANAGER",
+        },
+        load_dotenv=False,
+        config_path="__none__.yaml",
+    )
+    conn = db.init_db(str(tmp_path / "lunch.db"))
+    ids = [db.upsert_restaurant(conn, Restaurant(name=f"Candidate {i}")) for i in range(2)]
+    original_id = db.create_poll(conn, "C_TEST", ids)
+    replacement_ids = []
+
+    def close_then_fail(*args, **kwargs):
+        assert kwargs["expected_poll_id"] == original_id
+        assert db.close_poll_and_tally(conn, original_id)[0]
+        replacement_ids.append(db.create_poll(conn, "C_TEST", ids))
+        raise RuntimeError("announcement failed")
+
+    monkeypatch.setattr(scheduler, "close_poll_and_announce", close_then_fail)
+    app = build_app(config, conn, llm=_FixedRouter(MentionCommand("close_poll")))
+    replies = []
+    app.events["app_mention"](
+        event={"channel": "C_TEST", "user": "U_MANAGER", "text": "close poll"},
+        say=replies.append,
+        client=_FakeSlackClient(),
+    )
+
+    assert db.get_open_poll(conn, "C_TEST")["id"] == replacement_ids[0]
+    assert "poll was closed" in replies[0]
+    assert "announcement failed" in replies[0]
 
 
 def test_manager_cancels_poll_without_winner_or_vote_totals(monkeypatch, tmp_path):
