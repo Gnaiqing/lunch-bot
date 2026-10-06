@@ -10,6 +10,7 @@ plain dict payloads (Block Kit JSON), so it can be unit-tested without Slack.
 
 from __future__ import annotations
 
+import threading
 from typing import Optional
 
 from . import db
@@ -17,6 +18,11 @@ from .models import Restaurant
 
 # action_id prefix for a vote button: "vote::<poll_id>::<restaurant_id>"
 VOTE_ACTION_PREFIX = "vote"
+
+# Slack message updates are not transactional with SQLite writes. Serialize every
+# vote/close render in this process so an older open-poll render cannot arrive
+# after the close render and visually restore vote buttons.
+POLL_MESSAGE_LOCK = threading.RLock()
 
 
 def vote_action_id(poll_id: int, restaurant_id: int) -> str:
@@ -38,21 +44,14 @@ def parse_vote_action_id(action_id: str) -> Optional[tuple[int, int]]:
         return None
 
 
-def _restaurant_label(r: Restaurant) -> str:
-    """Human label for a poll option button/line."""
-    bits = [r.name]
-    if r.cuisine:
-        bits.append(f"({r.cuisine})")
-    return " ".join(bits)
-
-
 def build_poll_blocks(
     poll_id: int,
     restaurants: list[Restaurant],
     *,
     tally: Optional[dict[int, int]] = None,
+    voters: Optional[dict[int, list[str]]] = None,
     closed: bool = False,
-    header: str = "🍽️ Lunch poll — vote for this week's pick!",
+    header: str = "🍽️ Group Lunch",
 ) -> list[dict]:
     """Build the Block Kit blocks for a poll message.
 
@@ -60,6 +59,7 @@ def build_poll_blocks(
         poll_id: The poll's DB id (encoded into button action_ids).
         restaurants: The options, in display order.
         tally: Optional ``{restaurant_id: votes}`` to render current counts.
+        voters: Optional ``{restaurant_id: [slack_user_id, ...]}`` for mentions.
         closed: If ``True``, render a closed/read-only view (no buttons).
         header: The header text.
 
@@ -67,16 +67,27 @@ def build_poll_blocks(
         A list of Block Kit block dicts suitable for ``chat_postMessage``.
     """
     tally = tally or {}
+    voters = voters or {}
+    total_selections = sum(tally.values())
     blocks: list[dict] = [
         {"type": "header", "text": {"type": "plain_text", "text": header}},
     ]
 
     for r in restaurants:
         count = tally.get(r.id, 0)
-        line = _restaurant_label(r)
-        if tally or closed:
-            line += f" — {count} vote" + ("" if count == 1 else "s")
-        section = {"type": "section", "text": {"type": "mrkdwn", "text": f"*{line}*"}}
+        cuisine = f" [{r.cuisine}]" if r.cuisine else ""
+        name = f"<{r.maps_url}|{r.name}>" if r.maps_url else r.name
+        percentage = (
+            int((count / total_selections) * 100 + 0.5) if total_selections else 0
+        )
+        bar_width = 24
+        filled = round((percentage / 100) * bar_width)
+        bar = "█" * filled + "░" * (bar_width - filled)
+        voter_mentions = ", ".join(f"<@{user_id}>" for user_id in voters.get(r.id, []))
+        text = f"*{name}{cuisine}*\n`{bar}`  |  {percentage}% ({count})"
+        if voter_mentions:
+            text += f"\n{voter_mentions}"
+        section = {"type": "section", "text": {"type": "mrkdwn", "text": text}}
         if not closed and r.id is not None:
             section["accessory"] = {
                 "type": "button",
@@ -95,7 +106,10 @@ def build_poll_blocks(
             {
                 "type": "context",
                 "elements": [
-                    {"type": "mrkdwn", "text": "One vote per person — click again to change it."}
+                    {
+                        "type": "mrkdwn",
+                        "text": "You may vote for multiple options — click an option again to remove your vote.",
+                    }
                 ],
             }
         )
@@ -132,7 +146,7 @@ def build_order_reminder_blocks(
 
 
 def handle_vote(conn, action_id: str, slack_user_id: str) -> Optional[tuple[int, int]]:
-    """Record a vote from a button click.
+    """Toggle a vote from a button click.
 
     Returns ``(poll_id, restaurant_id)`` on success, or ``None`` if the vote
     should be ignored: the action isn't a recognisable vote action, the poll is
@@ -148,9 +162,9 @@ def handle_vote(conn, action_id: str, slack_user_id: str) -> Optional[tuple[int,
     # Check-and-insert must be atomic: the status/option validation and the insert
     # run under a single DB write lock (shared with the poll-close path) so a close
     # can't slip between the check and the insert and let a late vote land after the
-    # tally. ``record_vote_if_open`` returns ``False`` for a closed/missing poll or
+    # tally. ``toggle_vote_if_open`` returns ``None`` for a closed/missing poll or
     # an invalid/forged option, which we surface as an ignored vote.
-    if not db.record_vote_if_open(conn, poll_id, restaurant_id, slack_user_id):
+    if db.toggle_vote_if_open(conn, poll_id, restaurant_id, slack_user_id) is None:
         return None
     return poll_id, restaurant_id
 

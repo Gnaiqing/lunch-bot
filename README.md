@@ -5,7 +5,7 @@
 CI runs the `pytest` suite on every push and pull request.
 
 A Slack bot that runs a weekly lunch-decision workflow for a reading group: it
-discovers nearby restaurants, posts a diversity-aware poll, records votes,
+validates explicitly suggested restaurants, posts a diversity-aware poll, records votes,
 announces the winner, and reminds the group to order — while the **organizer**
 (a human) creates and places the actual Uber Eats group order.
 
@@ -23,26 +23,115 @@ group* below).
 
 ## Weekly flow
 
-All days/times are configurable per group (defaults shown; times local to
+Automatic scheduling is currently disabled by default. If explicitly enabled,
+all days/times are configurable per group (defaults shown; times local to
 `timezone`, default `America/Toronto`):
 
 | When | What happens |
 |------|--------------|
 | **Mon 10:00 — poll create** | Bot selects 4–6 diverse restaurants (see below) and posts a Block Kit poll, opening voting. |
-| **Mon–Wed** | Team votes via poll buttons; votes are recorded in SQLite (one per person, changeable). |
+| **Mon–Wed** | Team votes via poll buttons; each person may select multiple choices and click one again to remove that vote. |
 | **Wed 10:00 — poll close + announce** | Bot closes the poll, tallies + records votes (updating preference memory), and announces the winner. It prompts the **organizer** to create and post the Uber Eats **group-order** link (a suggested search is included to save a lookup). |
 | **Thu 10:00 — order reminder** | Bot pings the group to place their orders on the group-order link before the deadline. |
 | **Thu 11:00 — order deadline** | **Human step (no bot job):** the organizer closes the link and places the order. |
 
 **The bot never creates or places the order.** At any time, a member can
-**@-mention the bot** to suggest a restaurant; the bot parses the free text (LLM),
-validates it via Google Places, and adds it to the pool.
+**@-mention the bot** to manage polls, inspect the candidate list, or suggest a
+restaurant. New restaurants are validated through Google Places before being
+added to the pool.
+
+## Slack commands
+
+Commands are conversational and accept either `poll` or `polly`:
+
+```text
+@lunch-bot help
+@lunch-bot show current restaurants
+@lunch-bot explore 10 nearby restaurants
+@lunch-bot add Pai Northern Thai to the candidate list
+@lunch-bot create a poll with 4 choices
+@lunch-bot create a poll with 4 choices including Pala 148
+@lunch-bot add a pizza restaurant to this week's poll
+@lunch-bot remove Miznon from the current poll
+@lunch-bot remove all items in other from the candidate list
+@lunch-bot close the current poll
+@lunch-bot close the current poll and start a new poll with 4 choices
+@lunch-bot cancel the current poll
+@lunch-bot send the order reminder
+@lunch-bot show removed restaurants
+@lunch-bot restore Scotland Yard Pub to the candidate list
+@lunch-bot rename Old Name to New Name
+@lunch-bot change Miznon's cuisine to Mediterranean
+@lunch-bot merge Raku duplicate into Raku
+@lunch-bot refresh Miznon's Google Maps location
+@lunch-bot show the current poll
+@lunch-bot where is Miznon? Can you provide its Google Maps link?
+```
+
+Poll creation refuses to replace an already-open poll, preserving its choices
+and votes; the database enforces one open poll per channel. Adding a named
+restaurant first uses the existing candidate pool; if it is not present, the bot validates it
+through Google Places and adds it. A cuisine request such as “pizza restaurant”
+selects a matching candidate that is not already in the poll.
+
+The read-only `explore` command searches Google Places for up to 5–10 restaurants
+that are not already present in the database, including inactive entries. It
+requires the Google `restaurant` type, rejects lodging/hotels, verifies an actual
+distance of at most 5 km from the configured office, requires a rating above 3.0,
+and requires a known Google price level of 0–2. Google does not provide a precise
+average meal price in this response, so price level 0–2 is used as the approximate
+proxy for the ~$30/person target. Exploration never adds its results automatically.
+
+Everyone may add restaurants to either collection. Adding a restaurant to the
+current poll also keeps it in the reusable candidate list. Only Slack users in
+`manager_user_ids` / `SLACK_MANAGER_USER_IDS` may remove entries. Removing from
+the current poll leaves the restaurant in the candidate list; removing from the
+candidate list soft-deactivates it and also removes it from an open poll, if
+present. Managers may also close the current poll, optionally followed by
+creating a replacement poll in the same command. Closing disables voting,
+records the final tally, and announces the winner. Historical poll records are
+retained.
+
+Poll creation selects exclusively from the currently active candidate list. It
+does not run automatic Google Places discovery, add new restaurants, or
+reactivate removed candidates. A restaurant can enter the pool only through an
+explicit user addition followed by Google Maps confirmation (or a manager
+restore of an inactive candidate).
+
+Automatic scheduling is disabled by default (`scheduler_enabled: false` or
+`SCHEDULER_ENABLED=false`). Managers explicitly close/cancel polls and send the
+order reminder; poll creation remains an explicit Slack command available to
+members. Set the flag to `true` to restore the configured create/close/reminder
+cron jobs.
+
+Bulk removals show a persisted confirmation card before changing anything.
+Managers can list and restore inactive candidates, rename restaurants, change
+cuisine labels, refresh a Google Maps match through the normal confirmation
+flow, and merge duplicate records while preserving poll/vote history. Polls are
+limited to `max_poll_options` choices (default 10). Cancelling a poll disables
+voting without selecting a winner or folding its votes into preference history.
+
+An LLM classifies conversational requests into a strict command schema. Trusted
+application code validates that schema and performs all channel checks,
+confirmations, and database writes. Negated, hypothetical, ambiguous, malformed,
+or unavailable model responses never mutate the database. Restaurant suggestions
+must be explicit, such as
+`add Pai Northern Thai to the candidate list` or
+`restaurant suggestion: Pai Northern Thai`. Suggested places must be food-related,
+within the configured search radius, and within the configured price level. The
+bot then shows the matched Google Maps name and address with **Confirm** and
+**Not this one** buttons. Only the requesting user can confirm, and the restaurant
+is not added to the candidate list or an open poll until that confirmation.
+Stored candidates include their verified address, coordinates, Google Place ID,
+and a place-specific Maps URL. Run `python scripts/backfill_restaurant_locations.py`
+to enrich older rows that predate these fields.
 
 ## Architecture
 
 ```
 Slack (Socket Mode)  ─┐
-                      ├─ slack_app.py   app_mention (suggestions) + poll button votes
+                      ├─ slack_app.py   conversational commands + poll button votes
+                      ├─ commands.py    typed command schema + route validation
 APScheduler  ─────────┤
                       ├─ scheduler.py   poll_create · poll_close+announce · order_reminder
                       │
@@ -50,7 +139,7 @@ APScheduler  ─────────┤
                       ├─ selection.py   diversity + vote-weighted UCB sampling  (PURE, unit-tested)
                       ├─ polls.py       Block Kit poll build + vote handling + tally
                       ├─ ubereats.py    order summary + Uber Eats link (NO automation)
-                      ├─ llm.py         Anthropic (Claude) or OpenAI (GPT) cuisine tag + suggestion parse
+                      ├─ llm.py         semantic routing + cuisine/suggestion language tasks
                       ├─ db.py          SQLite schema + query helpers (stdlib sqlite3)
                       ├─ models.py      Restaurant / Poll / Vote dataclasses
                       └─ config.py      env + config.yaml -> Config dataclass
@@ -61,10 +150,12 @@ APScheduler  ─────────┤
 - **Scheduling:** `APScheduler` (three configurable cron jobs: poll create /
   poll close+announce / order reminder).
 - **Storage:** SQLite via the stdlib `sqlite3` (single file, path configurable, gitignored).
-- **Discovery:** Google Places Nearby Search + Geocoding (`googlemaps`).
+- **Validation:** Google Places search + Geocoding (`googlemaps`) for explicit
+  additions and location corrections; poll creation never runs discovery.
 - **LLM:** pluggable provider (`llm_provider`) — Anthropic `anthropic` SDK
   (`claude-haiku-4-5`, default) or OpenAI `openai` SDK (`gpt-4o-mini`), both
-  fast/cheap, for cuisine tagging and parsing free-text restaurant suggestions.
+  fast/cheap, for semantic routing, cuisine tagging, conversational QA, and
+  parsing free-text restaurant suggestions.
   Only the selected provider's API key is needed.
 - **Deploy:** a lab compute cluster via **SkyPilot** (`sky.yaml`).
 
@@ -159,7 +250,9 @@ App-level token scope summary: `connections:write` (Socket Mode) + bot scopes
 ### 3. LLM provider key (Anthropic or OpenAI)
 
 Pick a provider with `LLM_PROVIDER` (`anthropic` or `openai`, default `anthropic`).
-Only the selected provider's key is required; the LLM is optional overall.
+Only the selected provider's key is required. The process can run without an
+LLM, but state-changing conversational commands fail closed until it is enabled;
+read-only help and list requests remain available.
 
 - **Anthropic:** get a key at <https://console.anthropic.com/> → `ANTHROPIC_API_KEY`.
   Model defaults to `claude-haiku-4-5` (fast/cheap), overridable via `ANTHROPIC_MODEL`.
@@ -177,6 +270,9 @@ cp config.example.yaml config.yaml # adjust non-secret knobs (both .env and conf
 ```
 
 Environment variables override `config.yaml`. Secrets belong in `.env` only.
+Set `SLACK_MANAGER_USER_IDS` to a comma- or space-separated list of Slack member
+IDs allowed to remove candidates and current-poll choices. The project default
+is Naiqing's member ID (`U0AA0UMN333`).
 
 ## Install & run locally
 
@@ -194,7 +290,8 @@ connects to Slack via Socket Mode (it blocks and runs forever).
 ## Seed the pool from CSV
 
 Provide a CSV with a header row; recognised columns (case-insensitive):
-`name` (required), `cuisine`, `address`, `place_id`, `lat`, `lng`, `price_level`.
+`name` (required), `cuisine`, `address`, `place_id`, `lat`, `lng`, `maps_url`,
+`price_level`.
 
 ```bash
 python scripts/seed_from_csv.py                     # uses config restaurants_csv
@@ -248,10 +345,13 @@ See `sky.yaml` for how secrets are provided (synced `.env` file mount, or
 ## Data model (SQLite)
 
 - `restaurants` — the pool: `name, cuisine, address, place_id (unique), lat, lng,
-  price_level, source ('seed'|'places'|'suggestion'), active, times_selected,
+  maps_url, price_level, source ('seed'|'places'|'suggestion'), active, times_selected,
   total_votes, last_selected_at, created_at`.
 - `polls` — `slack_channel, slack_ts, created_at, closes_at, status
   ('open'|'closed'), winner_restaurant_id`.
 - `poll_options` — options offered in a poll (`poll_id`, `restaurant_id`).
+- `restaurants` location metadata includes `address`, `place_id`, `lat`, `lng`,
+  and `maps_url`.
 - `votes` — `poll_id, restaurant_id, slack_user_id, created_at`, unique on
-  `(poll_id, slack_user_id)` so a user's vote can change but is counted once.
+  `(poll_id, restaurant_id, slack_user_id)` so each user may select multiple
+  choices but cannot duplicate a vote for the same choice.

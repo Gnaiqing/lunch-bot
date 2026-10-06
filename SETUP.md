@@ -147,8 +147,11 @@ Secrets come from `.env` (or the shell). Non-secret knobs can live in `.env`
 | `DB_PATH`              | no      | SQLite database file path (default `lunch_bot.db`). |
 | `RESTAURANTS_CSV`      | no      | Candidate source for the seed script (default `data/restaurants_seed.csv`). |
 | `TIMEZONE`             | no      | Scheduler timezone (default `America/Toronto`). |
+| `SCHEDULER_ENABLED`    | no      | Enable automatic poll creation/closing and reminders (default `false`). |
 
-The weekly **schedule** (days + times for `poll_create`, `poll_close`,
+The automatic scheduler is disabled by default. When `scheduler_enabled: true`
+is set in `config.yaml` (or `SCHEDULER_ENABLED=true` in the environment), the
+weekly **schedule** (days + times for `poll_create`, `poll_close`,
 `order_reminder`, and the informational `order_deadline`) lives in `config.yaml`
 under a `schedule:` block — see `config.example.yaml`. Each phase takes a weekday
 (`mon`..`sun`, or a full name) and an `"HH:MM"` 24-hour time, interpreted in
@@ -186,7 +189,8 @@ python scripts/seed_from_csv.py data/restaurants_seed.csv --db-path lunch_bot.db
 
 Rows are inserted with `source = 'seed'` and de-duplicated by `place_id` (or by
 name when no `place_id` is present). Recognised CSV columns (case-insensitive):
-`name` (required), `cuisine`, `address`, `place_id`, `lat`, `lng`, `price_level`.
+`name` (required), `cuisine`, `address`, `place_id`, `lat`, `lng`, `maps_url`,
+`price_level`.
 
 ## 8. Local dry run
 
@@ -233,18 +237,28 @@ sky down lunch-bot     # tear down
 
 ## 10. Weekly flow
 
-Defaults shown; all days/times are configurable via `schedule` (see §6) and local
-to `timezone`.
+The timed steps below run only when `scheduler_enabled` is true. It defaults to
+false, in which case a manager must explicitly create/close polls and send the
+order reminder. All days/times are configurable via `schedule` (see §6) and
+local to `timezone`.
 
-- **Poll create — Mon 10:00** — the scheduler auto-selects 4–6 diverse
+- **Poll create — Mon 10:00 (when enabled)** — the scheduler auto-selects 4–6 diverse
   restaurants and posts the Block Kit poll to the channel, opening voting.
-- **Mon–Wed** — the team votes via the poll buttons (one vote per person,
-  changeable); anyone can @-mention the bot to suggest a new restaurant.
-- **Poll close + announce — Wed 10:00** — the bot closes the poll, tallies and
+- **Mon–Wed** — the team votes via the poll buttons (multiple choices per
+  person; click a selected choice again to remove it). Anyone can @-mention the
+  bot to list or add restaurant candidates, create or inspect a poll, and add a
+  restaurant or cuisine choice to the open poll. Mention `@Lunch Bot help` for
+  examples. Unmatched messages use read-only conversational QA; only explicit
+  restaurant-suggestion commands can modify the candidate list. A new Google
+  Maps match is shown to the requester for confirmation first; it is added only
+  after that user clicks **Confirm**.
+- Poll results show each choice's share of all selections and mention the Slack
+  users who selected it. Restaurant names link to their stored Google Maps URL.
+- **Poll close + announce — Wed 10:00 (when enabled)** — the bot closes the poll, tallies and
   records the votes (updating preference memory), and announces the winner. It
   prompts the **organizer** to create and post the Uber Eats **group-order** link
   (a suggested search is included to save a lookup).
-- **Order reminder — Thu 10:00** — the bot pings the group to place their orders
+- **Order reminder — Thu 10:00 (when enabled)** — the bot pings the group to place their orders
   on the group-order link before the deadline.
 - **Order deadline — Thu 11:00 (human step, no bot job)** — the organizer closes
   the link and places the actual order. **The bot never creates or places the
