@@ -277,3 +277,38 @@ def test_poll_creation_never_discovers_or_reactivates_removed_candidates(
     assert set(db.get_poll_option_ids(conn, poll_id)) == set(active_ids)
     assert removed_id not in db.get_poll_option_ids(conn, poll_id)
     assert db.get_restaurant(conn, removed_id).active is False
+
+
+def test_creation_excludes_last_week_winner_even_when_required(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    conn = db.init_db(str(tmp_path / 'lunch.db'))
+    ids = _seed(conn, n=3)
+    previous = db.create_poll(conn, 'C_TEST', ids)
+    db.close_poll(conn, previous, ids[0])
+    conn.execute('UPDATE polls SET created_at = ? WHERE id = ?',
+                 ((datetime.now(timezone.utc) - timedelta(days=7)).isoformat(), previous))
+    conn.commit()
+    client = _OkClient()
+    poll_id = scheduler.create_weekly_poll(
+        _config(), conn, client, poll_size=3, required_restaurant_ids=[ids[0]],
+    )
+    assert set(db.get_poll_option_ids(conn, poll_id)) == set(ids[1:])
+    assert db.get_restaurant(conn, ids[0]).active
+    assert db.get_restaurant(conn, ids[0]).times_selected == 1
+
+
+def test_creation_skips_when_only_last_week_winner_is_available(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    conn = db.init_db(str(tmp_path / 'lunch.db'))
+    ids = _seed(conn, n=1)
+    previous = db.create_poll(conn, 'C_TEST', ids)
+    db.close_poll(conn, previous, ids[0])
+    conn.execute('UPDATE polls SET created_at = ? WHERE id = ?',
+                 ((datetime.now(timezone.utc) - timedelta(days=7)).isoformat(), previous))
+    conn.commit()
+    client = _OkClient()
+    assert scheduler.create_weekly_poll(_config(), conn, client) is None
+    assert client.calls == 0
+    assert db.get_open_poll(conn, 'C_TEST') is None

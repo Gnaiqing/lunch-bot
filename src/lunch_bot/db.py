@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
+from zoneinfo import ZoneInfo
 
 from .models import Restaurant
 
@@ -751,6 +752,34 @@ def set_poll_ts(conn: sqlite3.Connection, poll_id: int, slack_ts: str) -> None:
 def get_poll(conn: sqlite3.Connection, poll_id: int) -> Optional[sqlite3.Row]:
     """Return a poll row by id (or ``None`` if it does not exist)."""
     return conn.execute("SELECT * FROM polls WHERE id = ?", (poll_id,)).fetchone()
+
+
+def get_previous_week_winner_ids(
+    conn: sqlite3.Connection,
+    slack_channel: str,
+    timezone_name: str,
+    *,
+    now: datetime | None = None,
+) -> set[int]:
+    """Winners of closed polls created in the preceding local Mon–Sun week.
+
+    Scope history to the channel. A skipped week does not extend the cooldown;
+    cancelled polls and polls without a winner never exclude a restaurant.
+    """
+    local_now = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo(timezone_name))
+    week_start = (local_now - timedelta(days=local_now.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    previous_start = week_start - timedelta(days=7)
+    rows = conn.execute(
+        """SELECT DISTINCT winner_restaurant_id FROM polls
+           WHERE slack_channel = ? AND status = 'closed'
+             AND winner_restaurant_id IS NOT NULL
+             AND julianday(created_at) >= julianday(?)
+             AND julianday(created_at) < julianday(?)""",
+        (slack_channel, previous_start.isoformat(), week_start.isoformat()),
+    ).fetchall()
+    return {row["winner_restaurant_id"] for row in rows}
 
 
 def get_poll_option_ids(conn: sqlite3.Connection, poll_id: int) -> list[int]:

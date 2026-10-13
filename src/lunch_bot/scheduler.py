@@ -48,9 +48,15 @@ def create_weekly_poll(
     """
     config.require("slack_channel_id")
 
-    active = db.get_active_restaurants(conn)
+    excluded_ids = db.get_previous_week_winner_ids(
+        conn, config.slack_channel_id, config.timezone
+    )
+    active = [
+        restaurant for restaurant in db.get_active_restaurants(conn)
+        if restaurant.id not in excluded_ids
+    ]
     if not active:
-        logger.warning("No active restaurants in the pool; skipping poll creation.")
+        logger.warning("No eligible restaurants in the pool; skipping poll creation.")
         return None
 
     requested_size = poll_size if poll_size is not None else config.poll_size
