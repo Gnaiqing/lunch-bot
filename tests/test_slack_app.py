@@ -1963,3 +1963,41 @@ def test_add_confirmation_notification_failure_keeps_committed_state(
     ]
     assert db.get_pending_restaurant_confirmation(conn, token)["status"] == "confirmed"
     assert "Confirmed and added" in client.ephemeral[0]["text"]
+
+
+@pytest.mark.parametrize('kind', ['create_poll', 'add_to_poll'])
+def test_mentions_reject_last_week_winner(monkeypatch, tmp_path, kind):
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setattr('slack_bolt.App', _FakeBoltApp)
+    config = load_config(
+        env={'SLACK_BOT_TOKEN': 'xoxb-test', 'SLACK_CHANNEL_ID': 'C_TEST'},
+        load_dotenv=False, config_path='__none__.yaml',
+    )
+    conn = db.init_db(str(tmp_path / 'lunch.db'))
+    winner = db.upsert_restaurant(conn, Restaurant(name='Last Winner'))
+    other = db.upsert_restaurant(conn, Restaurant(name='Other Choice'))
+    previous = db.create_poll(conn, 'C_TEST', [winner, other])
+    db.close_poll(conn, previous, winner)
+    conn.execute('UPDATE polls SET created_at = ? WHERE id = ?',
+                 ((datetime.now(timezone.utc) - timedelta(days=7)).isoformat(), previous))
+    conn.commit()
+    if kind == 'add_to_poll':
+        current = db.create_poll(conn, 'C_TEST', [other])
+        db.set_poll_ts(conn, current, '123.456')
+    app = build_app(config, conn, llm=_FixedRouter(
+        MentionCommand(kind, queries=['Last Winner'], count=2 if kind == 'create_poll' else None)
+    ))
+    client = _FakeSlackClient()
+    replies = []
+    app.events['app_mention'](
+        event={'channel': 'C_TEST', 'text': '<@U_BOT> include Last Winner'},
+        say=replies.append, client=client,
+    )
+    assert any('won last week' in reply for reply in replies)
+    assert not client.posts
+    assert not client.updates
+    if kind == 'add_to_poll':
+        assert db.get_poll_option_ids(conn, current) == [other]
+    else:
+        assert db.get_open_poll(conn, 'C_TEST') is None

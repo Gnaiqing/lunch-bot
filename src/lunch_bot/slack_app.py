@@ -21,6 +21,7 @@ import json
 import random
 import re
 import uuid
+from datetime import datetime
 
 from . import db, polls
 from .commands import (
@@ -407,8 +408,16 @@ def build_app(config: Config, conn, llm=None):
         with polls.POLL_MESSAGE_LOCK:
             added_ids = []
             rejected_ids = []
+            poll = db.get_poll(conn, poll_id)
+            excluded_ids = db.get_previous_week_winner_ids(
+                conn, config.slack_channel_id, config.timezone,
+                now=datetime.fromisoformat(poll["created_at"]) if poll else None,
+            )
             try:
                 for restaurant_id in restaurant_ids:
+                    if restaurant_id in excluded_ids:
+                        rejected_ids.append(restaurant_id)
+                        continue
                     if db.add_poll_option_if_open(
                         conn,
                         poll_id,
@@ -445,11 +454,15 @@ def build_app(config: Config, conn, llm=None):
 
         required_ids: list[int] = []
         unresolved: list[str] = []
+        cooldown_ids = db.get_previous_week_winner_ids(
+            conn, config.slack_channel_id, config.timezone
+        )
         entities = [(query, False) for query in command.queries]
         entities.extend((query, True) for query in command.cuisines)
         for query, is_cuisine in entities:
             restaurant, ambiguous = choose_from_pool(
-                query, excluding=set(required_ids), cuisine=is_cuisine
+                query, excluding=set(required_ids) | (cooldown_ids if is_cuisine else set()),
+                cuisine=is_cuisine
             )
             if ambiguous:
                 unresolved.append(
@@ -458,6 +471,11 @@ def build_app(config: Config, conn, llm=None):
                 )
                 continue
             if restaurant is not None and restaurant.id is not None:
+                if restaurant.id in cooldown_ids:
+                    unresolved.append(
+                        f"'{restaurant.name}' won last week and is sitting out this week's poll."
+                    )
+                    continue
                 required_ids.append(restaurant.id)
                 continue
             if is_cuisine:
@@ -510,6 +528,10 @@ def build_app(config: Config, conn, llm=None):
             return
 
         existing_ids = set(db.get_poll_option_ids(conn, poll["id"]))
+        cooldown_ids = db.get_previous_week_winner_ids(
+            conn, config.slack_channel_id, config.timezone,
+            now=datetime.fromisoformat(poll["created_at"]),
+        )
         pending_additions: list[Restaurant] = []
         failures: list[str] = []
         entities = [(query, False) for query in command.queries]
@@ -525,13 +547,18 @@ def build_app(config: Config, conn, llm=None):
                 for restaurant in pending_additions
                 if restaurant.id is not None
             }
-            excluded_ids = existing_ids | pending_ids
+            excluded_ids = existing_ids | pending_ids | cooldown_ids
             if not is_cuisine:
                 existing_match, ambiguous = choose_from_pool(query)
                 if ambiguous:
                     failures.append(
                         f"'{query}' matches multiple restaurants: {', '.join(ambiguous)}. "
                         "Please use the full name."
+                    )
+                    continue
+                if existing_match is not None and existing_match.id in cooldown_ids:
+                    failures.append(
+                        f"'{existing_match.name}' won last week and is sitting out this week's poll."
                     )
                     continue
                 if existing_match is not None and existing_match.id in excluded_ids:

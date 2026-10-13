@@ -430,3 +430,34 @@ def test_write_from_separate_thread(tmp_path):
 
     assert errors == [], f"write from worker thread raised: {errors}"
     assert conn.execute("SELECT COUNT(*) AS c FROM restaurants").fetchone()["c"] == 1
+
+
+def test_previous_week_winners_use_local_calendar_and_channel(tmp_path):
+    from datetime import datetime
+
+    conn = db.init_db(str(tmp_path / 'lunch.db'))
+    ids = [db.upsert_restaurant(conn, Restaurant(name=f'R{i}')) for i in range(8)]
+    # Toronto's DST transition falls in this week: both boundaries matter.
+    cases = [
+        ('2026-10-26T04:00:00+00:00', 'C_TEST', 'closed', ids[0]),
+        ('2026-11-02T04:59:59+00:00', 'C_TEST', 'closed', ids[1]),
+        ('2026-10-26T03:59:59+00:00', 'C_TEST', 'closed', ids[2]),
+        ('2026-11-02T05:00:00+00:00', 'C_TEST', 'closed', ids[3]),
+        ('2026-10-28T12:00:00+00:00', 'C_OTHER', 'closed', ids[4]),
+        ('2026-10-28T12:00:00+00:00', 'C_TEST', 'cancelled', ids[5]),
+        ('2026-10-28T12:00:00+00:00', 'C_TEST', 'open', ids[6]),
+        ('2026-10-28T12:00:00+00:00', 'C_TEST', 'closed', None),
+    ]
+    conn.executemany(
+        'INSERT INTO polls (created_at, slack_channel, status, winner_restaurant_id) VALUES (?, ?, ?, ?)',
+        cases,
+    )
+    conn.commit()
+    assert db.get_previous_week_winner_ids(
+        conn, 'C_TEST', 'America/Toronto',
+        now=datetime.fromisoformat('2026-11-02T05:00:00+00:00'),
+    ) == {ids[0], ids[1]}
+    assert db.get_previous_week_winner_ids(
+        conn, 'C_TEST', 'America/Toronto',
+        now=datetime.fromisoformat('2026-11-16T05:00:00+00:00'),
+    ) == set()

@@ -172,6 +172,12 @@ unit-tested and deterministic with a seeded RNG. It balances *diversity* against
     offered but earned zero votes.
   - `exploration_bonus = C / sqrt(times_selected + 1)` (C configurable).
   - `score = avg_or_prior + exploration_bonus`, used as a positive sampling weight.
+- **Winner cooldown:** exclude winners of closed polls created in the previous
+  Monday–Sunday week, using the configured timezone and the same Slack channel.
+  They become eligible again the following week. Cancelled polls and polls without
+  a winner do not count. This also applies to named inclusions and additions to
+  a poll. If too few eligible candidates remain, create a smaller poll; if none
+  remain, skip creation.
 - **Diversity:** group by cuisine, iteratively pick distinct cuisines (weighted by
   each cuisine's aggregate score), then sample one restaurant within that cuisine
   (weighted by score), without replacement, until N are chosen. If distinct
